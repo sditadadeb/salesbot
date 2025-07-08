@@ -1,40 +1,37 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import logging
 
 app = FastAPI()
 
-# Middleware CORS — bien configurado
+# Middleware CORS (ok)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción: restringir esto a tus dominios
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Habilitamos logs para debug
-logging.basicConfig(level=logging.INFO)
-
-# Lógica de respuesta del bot
+# Simula una respuesta de tu bot
 def run_chain(user_input: str) -> str:
-    return f'Soy Sales Bot, recibí tu mensaje: "{user_input}"'
+    return f"Soy Sales Bot, recibí tu mensaje: \"{user_input}\""
 
-# Webhook que recibe los eventos desde Google Chat
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        data = await request.json()
-        logging.info(f"DEBUG - data recibido: {data}")
-    except Exception as e:
-        logging.exception("Error leyendo JSON desde la request")
-        return {"text": "No pude leer tu mensaje 😕"}
+    data = await request.json()
 
-    # Extraemos el texto útil que el usuario envió
-    user_input = data.get("message", {}).get("argumentText", "").strip()
+    # Extrae el texto según la estructura correcta del JSON
+    user_input = data.get("message", {}).get("text", "").strip()
 
-    if not user_input:
-        return {"text": "¿Me podés decir algo?"}
-
+    # Ejecuta la lógica
     response_text = run_chain(user_input)
-    return {"text": response_text}
+
+    # Google Chat espera una respuesta directa en el cuerpo JSON
+    return {
+        "text": response_text
+    }
+
+# Opcional para responder al GET raíz (evita el 404 de Render)
+@app.get("/")
+def index():
+    return {"status": "ok"}
