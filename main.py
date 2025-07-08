@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS – lo dejás igual
+# 1) CORS – igual que antes
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,27 +21,30 @@ async def webhook(request: Request):
         payload = await request.json()
         print("DEBUG payload recibido:", payload)
 
-        # ————— Corrijo aquí la extracción —————
-        chat_obj       = payload.get("chat", {})
-        msg_payload    = chat_obj.get("messagePayload", {})
-        msg            = msg_payload.get("message", {})
+        # 2) Extraigo desde payload["chat"]["messagePayload"]["message"]
+        chat_obj    = payload.get("chat", {})
+        mp          = chat_obj.get("messagePayload", {})
+        msg         = mp.get("message", {})
 
-        # Primero intento argumentText, si no, uso text
+        # 3) Primero argumentText (si viene), si no texto plano
         user_input = (msg.get("argumentText") or msg.get("text") or "").strip()
 
-        # Quito la mención si quedó pegada
-        if user_input.lower().startswith("botsales"):
-            user_input = user_input[len("botsales"):].strip()
+        # 4) Si quedó el username al principio, lo recorto
+        lower = user_input.lower()
+        for prefix in ("botsales", "@botsales", "bot sales"):
+            if lower.startswith(prefix):
+                user_input = user_input[len(prefix):].strip()
+                break
 
         if not user_input:
             return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-        # Lógica
-        reply = run_chain(user_input)
+        # 5) Llamo a tu lógica
+        reply_text = run_chain(user_input)
 
-        # Devuelvo el mismo hilo
+        # 6) Armo la respuesta, pegada al mismo hilo
+        response = {"text": reply_text}
         thread = msg.get("thread", {}).get("name")
-        response = {"text": reply}
         if thread:
             response["thread"] = {"name": thread}
 
