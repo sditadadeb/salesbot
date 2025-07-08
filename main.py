@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS (te sirve si luego llamás desde un browser u otro frontend)
+# CORS – lo dejás igual
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,31 +21,29 @@ async def webhook(request: Request):
         payload = await request.json()
         print("DEBUG payload recibido:", payload)
 
-        # 1) Extrae el nodo de message dentro de messagePayload
-        msg = payload.get("messagePayload", {}).get("message", {})
+        # ————— Corrijo aquí la extracción —————
+        chat_obj       = payload.get("chat", {})
+        msg_payload    = chat_obj.get("messagePayload", {})
+        msg            = msg_payload.get("message", {})
 
-        # 2) Toma primero argumentText, si está vacío, fallback a text
-        user_input = msg.get("argumentText", "").strip()
-        if not user_input:
-            user_input = msg.get("text", "").strip()
+        # Primero intento argumentText, si no, uso text
+        user_input = (msg.get("argumentText") or msg.get("text") or "").strip()
 
-        # 3) Quita la mención '@botSales' si quedó pegada
-        mention = "botsales"
-        low = user_input.lower()
-        if low.startswith(mention):
-            user_input = user_input[len(mention):].strip()
+        # Quito la mención si quedó pegada
+        if user_input.lower().startswith("botsales"):
+            user_input = user_input[len("botsales"):].strip()
 
         if not user_input:
             return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-        # 4) Lógica de tu bot
-        reply_text = run_chain(user_input)
+        # Lógica
+        reply = run_chain(user_input)
 
-        # 5) Responde en el mismo thread
-        thread_name = msg.get("thread", {}).get("name")
-        response: dict = {"text": reply_text}
-        if thread_name:
-            response["thread"] = {"name": thread_name}
+        # Devuelvo el mismo hilo
+        thread = msg.get("thread", {}).get("name")
+        response = {"text": reply}
+        if thread:
+            response["thread"] = {"name": thread}
 
         print("DEBUG respuesta a enviar:", response)
         return response
