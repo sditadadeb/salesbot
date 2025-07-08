@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS (útil si luego usás otro frontend)
+# CORS (te sirve si luego llamás desde un browser u otro frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,33 +18,42 @@ def run_chain(user_input: str) -> str:
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        data = await request.json()
-        print("DEBUG payload recibido:", data)
+        payload = await request.json()
+        print("DEBUG payload recibido:", payload)
 
-        msg = data.get("messagePayload", {}) \
-                  .get("message", {})
+        # 1) Extrae el nodo de message dentro de messagePayload
+        msg = payload.get("messagePayload", {}).get("message", {})
 
-        # 1) IntentText llega sin '@botSales', limpia la mención si existe
-        arg = msg.get("argumentText", "")
-        if not arg:
-            # 2) fallback al campo 'text'
-            arg = msg.get("text", "")
-        user_input = arg.strip()
+        # 2) Toma primero argumentText, si está vacío, fallback a text
+        user_input = msg.get("argumentText", "").strip()
+        if not user_input:
+            user_input = msg.get("text", "").strip()
 
-        # elimina @botSales si quedó
-        if user_input.lower().startswith("botsales"):
-            user_input = user_input[len("botsales"):].strip()
+        # 3) Quita la mención '@botSales' si quedó pegada
+        mention = "botsales"
+        low = user_input.lower()
+        if low.startswith(mention):
+            user_input = user_input[len(mention):].strip()
 
         if not user_input:
             return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-        response_text = run_chain(user_input)
-        return {"text": response_text}
+        # 4) Lógica de tu bot
+        reply_text = run_chain(user_input)
+
+        # 5) Responde en el mismo thread
+        thread_name = msg.get("thread", {}).get("name")
+        response: dict = {"text": reply_text}
+        if thread_name:
+            response["thread"] = {"name": thread_name}
+
+        print("DEBUG respuesta a enviar:", response)
+        return response
 
     except Exception as e:
         print("ERROR procesando webhook:", e)
         return {"text": "Ocurrió un error procesando tu mensaje."}
 
 @app.get("/")
-async def root():
+async def healthcheck():
     return {"status": "ok"}
