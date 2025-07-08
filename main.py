@@ -3,35 +3,41 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# 1) CORS middleware – útil si agregás después un frontend.
+# 1) CORS: si más tarde consumís desde otro frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # En prod restringir a tu dominio
+    allow_origins=["*"],      # En prod pon solo tu dominio
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 def run_chain(user_input: str) -> str:
-    # Tu lógica real o llamada a Langflow/LLM iría aquí.
+    # Aquí tu lógica real o llamada a Langflow/LLM
     return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
+
+@app.get("/")
+async def healthcheck():
+    # Ruta de salud para verificar que el servicio esté vivo
+    return {"status": "ok"}
 
 @app.get("/webhook")
 async def on_config_complete():
     """
-    2) Google Chat llama GET /webhook al
+    Google Chat llamará GET /webhook al 
     terminar la configuración (configCompleteRedirectUri).
-    Debe responder 200 OK para activar el bot.
+    Debe devolver 200 OK para activar el bot.
     """
     return Response(content="✅ Bot configurado correctamente", media_type="text/plain")
 
 @app.post("/webhook")
 async def webhook(request: Request):
     """
-    3) Aquí llega cada mensaje del espacio.
-    Extraemos texto de TODOS los campos posibles,
-    quitamos la mención @botsales, ejecutamos run_chain
-    y devolvemos {"text": ...}.
+    3) Aquí llegan todos los mensajes:
+    - Extraemos texto de cada payload
+    - Quitamos la mención si la hay (@botsales)
+    - Ejecutamos run_chain()
+    - Devolvemos JSON {"text": ...}
     """
     try:
         payload = await request.json()
@@ -42,18 +48,16 @@ async def webhook(request: Request):
     # DEBUG en logs de Render
     print("DEBUG Payload recibido:", payload)
 
-    # Extraer texto de todos los posibles lugares
-    common = payload.get("commonEventObject", {})
+    # Extraer texto de TODOS los posibles campos
     text = (
         payload.get("message", {}).get("text")
         or payload.get("argumentText")
-        or common.get("argumentText")
-        or common.get("message", {}).get("text")
+        or payload.get("commonEventObject", {}).get("argumentText")
         or payload.get("formattedText")
         or ""
     ).strip()
 
-    # Quitar @botsales al inicio si viene en grupo
+    # Si viene con @botsales al inicio, la quitamos
     if text.lower().startswith("@botsales"):
         parts = text.split(" ", 1)
         text = parts[1].strip() if len(parts) > 1 else ""
@@ -61,8 +65,8 @@ async def webhook(request: Request):
     if not text:
         return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-    # Tu lógica / LLM
+    # Llamo a mi lógica / LLM
     response_text = run_chain(text)
 
-    # La respuesta que Google Chat va a publicar
+    # Google Chat espera un JSON con “text”
     return {"text": response_text}
