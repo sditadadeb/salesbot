@@ -20,27 +20,31 @@ async def webhook(request: Request):
     event = await request.json()
     print("DEBUG Payload recibido:", event)
 
-    # 1) IntentText (si vino como comando o mención con arg)
-    user_input = event.get("argumentText", "")
+    # 1) Si viene como complemento Workspace App, está bajo commonEventObject
+    common = event.get("commonEventObject", event)
 
-    # 2) Si no, toma el texto completo del mensaje
+    # 2) Intenta extraer argumentText de messagePayload (slash‐command o @mención)
+    mp = common.get("messagePayload", {})
+    user_input = mp.get("argumentText", "").strip()
+
+    # 3) Si no vino ahí, cae a message.text
     if not user_input:
-        user_input = event.get("message", {}).get("text", "")
+        user_input = common.get("message", {}).get("text", "").strip()
 
-    # 3) Quita la parte de mención al bot si existe ("@botSales …")
+    # 4) Quita la @mención inicial si existe
     if user_input.startswith("@"):
         parts = user_input.split(" ", 1)
         user_input = parts[1] if len(parts) > 1 else ""
-    user_input = user_input.strip()
+        user_input = user_input.strip()
 
-    # 4) Validación
+    # 5) Valida
     if not user_input:
         return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-    # 5) Lógica de respuesta
+    # 6) Lógica de respuesta
     response_text = run_chain(user_input)
 
-    # 6) Devuelvo JSON con el campo "text"
+    # 7) Devuelve la respuesta en el JSON
     return {"text": response_text}
 
 @app.get("/")
