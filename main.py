@@ -3,43 +3,46 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Middleware CORS (opcional pero útil)
+# CORS middleware (útil si luego consumís desde otro frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],    # En prod limita esto a tu dominio
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Lógica de respuesta
 def run_chain(user_input: str) -> str:
-    return f"Soy Sales Bot, recibí tu mensaje: \"{user_input}\""
+    return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
-# Endpoint que recibe los mensajes de Google Chat
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        data = await request.json()
-        user_input = ""
+    event = await request.json()
+    print("DEBUG Payload recibido:", event)
 
-        if isinstance(data, dict):
-            message = data.get("message", {})
-            user_input = message.get("argumentText", "").strip()
+    # 1) IntentText (si vino como comando o mención con arg)
+    user_input = event.get("argumentText", "")
 
-        response_text = run_chain(user_input)
+    # 2) Si no, toma el texto completo del mensaje
+    if not user_input:
+        user_input = event.get("message", {}).get("text", "")
 
-        return {
-            "text": response_text
-        }
+    # 3) Quita la parte de mención al bot si existe ("@botSales …")
+    if user_input.startswith("@"):
+        parts = user_input.split(" ", 1)
+        user_input = parts[1] if len(parts) > 1 else ""
+    user_input = user_input.strip()
 
-    except Exception as e:
-        print("Error procesando webhook:", str(e))
-        return {
-            "text": "Hubo un error procesando tu mensaje."
-        }
+    # 4) Validación
+    if not user_input:
+        return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-# Endpoint opcional para GET
+    # 5) Lógica de respuesta
+    response_text = run_chain(user_input)
+
+    # 6) Devuelvo JSON con el campo "text"
+    return {"text": response_text}
+
 @app.get("/")
-def index():
+async def root():
     return {"status": "ok"}
