@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS middleware (útil si luego consumís desde otro frontend)
+# CORS (útil si luego usás otro frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,16 +21,17 @@ async def webhook(request: Request):
         data = await request.json()
         print("DEBUG payload recibido:", data)
 
-        # Extraemos el texto correctamente
-        user_input = (
-            data
-            .get("messagePayload", {})
-            .get("message", {})
-            .get("argumentText", "")
-            .strip()
-        )
+        msg = data.get("messagePayload", {}) \
+                  .get("message", {})
 
-        # Si viniera la mención incluida, la sacamos
+        # 1) IntentText llega sin '@botSales', limpia la mención si existe
+        arg = msg.get("argumentText", "")
+        if not arg:
+            # 2) fallback al campo 'text'
+            arg = msg.get("text", "")
+        user_input = arg.strip()
+
+        # elimina @botSales si quedó
         if user_input.lower().startswith("botsales"):
             user_input = user_input[len("botsales"):].strip()
 
@@ -43,7 +44,6 @@ async def webhook(request: Request):
     except Exception as e:
         print("ERROR procesando webhook:", e)
         return {"text": "Ocurrió un error procesando tu mensaje."}
-
 
 @app.get("/")
 async def root():
