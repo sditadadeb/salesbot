@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Middleware CORS (por si accedés vía navegador también)
+# Middleware CORS (opcional pero útil)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,29 +12,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Respuesta del bot
+# Lógica de respuesta
 def run_chain(user_input: str) -> str:
     return f"Soy Sales Bot, recibí tu mensaje: \"{user_input}\""
 
+# Endpoint que recibe los mensajes de Google Chat
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+        user_input = ""
 
-    print("DATOS RECIBIDOS:", data)
+        if isinstance(data, dict):
+            message = data.get("message", {})
+            user_input = message.get("argumentText", "").strip()
 
-    # Manejo seguro del input
-    user_input = ""
-    if isinstance(data, dict):
-        message = data.get("message")
-        if isinstance(message, dict):
-            user_input = message.get("text", "").strip()
+        response_text = run_chain(user_input)
 
-    # Responder
-    return {
-        "text": run_chain(user_input)
-    }
+        return {
+            "text": response_text
+        }
 
-# Evita error 405 con GET
+    except Exception as e:
+        print("Error procesando webhook:", str(e))
+        return {
+            "text": "Hubo un error procesando tu mensaje."
+        }
+
+# Endpoint opcional para GET
 @app.get("/")
 def index():
     return {"status": "ok"}
