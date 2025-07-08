@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# 1) CORS (útil si luego llamas desde un front)
+# 1) Middleware CORS (útil si luego llamas desde un front)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],    # En prod restringir a tus dominios
@@ -13,7 +13,7 @@ app.add_middleware(
 )
 
 def run_chain(user_input: str) -> str:
-    # Aquí iría tu lógica real / llamada a LangFlow, etc.
+    # Aquí tu lógica real (Langflow, LLM, etc.)
     return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
 @app.post("/webhook")
@@ -21,49 +21,32 @@ async def webhook(request: Request):
     event = await request.json()
     print("DEBUG Payload recibido:", event)
 
-    # 2) extraemos el texto en todos los posibles lugares
-    #    — raíz (argumentText)
-    #    — commonEventObject.argumentText
-    #    — messagePayload.argumentText
-    #    — message.text o formattedText
-    user_input = (
-        event.get("argumentText")
+    # 2) Extraemos el texto de todos los posibles campos
+    msg = (
+        event.get("argumentText")                          # apps script
         or event.get("commonEventObject", {}).get("argumentText")
         or event.get("commonEventObject", {}).get("messagePayload", {}).get("argumentText")
-    )
+        or event.get("message", {}).get("text")            # webhook
+        or event.get("formattedText")                      # preview link
+    ) or ""
 
-    if not user_input:
-        msg = event.get("commonEventObject", {}).get("message", {})
-        user_input = (
-            msg.get("argumentText")
-            or msg.get("text")
-            or msg.get("formattedText", "")
-        )
+    user_input = msg.strip()
 
-    if not user_input:
-        # puede ser mensaje directo sin commonEventObject
-        user_input = (
-            event.get("messagePayload", {})
-                 .get("argumentText")
-            or event.get("message", {}).get("text", "")
-        )
-
-    user_input = (user_input or "").strip()
-
-    # 3) si vino con @mención la quitamos
-    if user_input.startswith("@"):
+    # 3) Si vino con @mención, la quitamos
+    if user_input.lower().startswith("@botsales"):
         parts = user_input.split(" ", 1)
         user_input = parts[1].strip() if len(parts) > 1 else ""
 
-    # 4) validación mínima
+    # 4) Validación mínima
     if not user_input:
         return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-    # 5) tu lógica
+    # 5) Llamamos a tu lógica
     response_text = run_chain(user_input)
 
-    # 6) devolvemos directamente
+    # 6) Devolvemos directamente el JSON que Google Chat publicará
     return {"text": response_text}
+
 
 @app.get("/")
 async def root():
