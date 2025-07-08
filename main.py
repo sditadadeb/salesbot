@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# 1) CORS – igual que antes
+# CORS — puedes restringir allow_origins en producción
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,48 +13,71 @@ app.add_middleware(
 )
 
 def run_chain(user_input: str) -> str:
+    # Aquí va tu lógica real / llamada a Langflow, etc.
     return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        payload = await request.json()
-        print("DEBUG payload recibido:", payload)
-
-        # 2) Extraigo desde payload["chat"]["messagePayload"]["message"]
-        chat_obj    = payload.get("chat", {})
-        mp          = chat_obj.get("messagePayload", {})
-        msg         = mp.get("message", {})
-
-        # 3) Primero argumentText (si viene), si no texto plano
-        user_input = (msg.get("argumentText") or msg.get("text") or "").strip()
-
-        # 4) Si quedó el username al principio, lo recorto
-        lower = user_input.lower()
-        for prefix in ("botsales", "@botsales", "bot sales"):
-            if lower.startswith(prefix):
-                user_input = user_input[len(prefix):].strip()
-                break
-
-        if not user_input:
-            return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
-
-        # 5) Llamo a tu lógica
-        reply_text = run_chain(user_input)
-
-        # 6) Armo la respuesta, pegada al mismo hilo
-        response = {"text": reply_text}
-        thread = msg.get("thread", {}).get("name")
-        if thread:
-            response["thread"] = {"name": thread}
-
-        print("DEBUG respuesta a enviar:", response)
-        return response
-
-    except Exception as e:
-        print("ERROR procesando webhook:", e)
-        return {"text": "Ocurrió un error procesando tu mensaje."}
 
 @app.get("/")
 async def healthcheck():
     return {"status": "ok"}
+
+@app.get("/webhook")
+async def on_config_complete():
+    """
+    Google Chat invoca GET /webhook como configCompleteRedirectUri.
+    Debe devolver 200 OK para que el bot quede activo.
+    """
+    return Response(content="✅ Bot configurado correctamente", media_type="text/plain")
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    """
+    Aquí llegan los mensajes (EVENT_TYPE.MESSAGE) y otros eventos.
+    Extraemos el texto de:
+      - messagePayload.argumentText
+      - messagePayload.message.argumentText
+      - messagePayload.message.text
+    Quitamos la @mención y devolvemos {"text": ...}, 
+    además de incluir el mismo hilo (thread.name) para que la respuesta
+    aparezca en el hilo correcto.
+    """
+    try:
+        payload = await request.json()
+    except:
+        return {"text": ""}
+
+    print("DEBUG payload recibido:", payload)
+
+    # 1) Navegamos hasta el objeto real
+    chat = payload.get("chat", {})
+    mp   = chat.get("messagePayload", {})
+    msg  = mp.get("message", {})
+
+    # 2) Extraemos el texto útil
+    text = (
+        mp.get("argumentText")             # payload['chat']['messagePayload']['argumentText']
+        or msg.get("argumentText")         # payload['chat']['messagePayload']['message']['argumentText']
+        or msg.get("text")                 # payload['chat']['messagePayload']['message']['text']
+        or ""
+    ).strip()
+
+    # 3) Limpiamos la mención si la trae
+    low = text.lower()
+    for prefix in ("@botsales", "botsales", "@bot sales", "bot sales"):
+        if low.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    if not text:
+        return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
+
+    # 4) Tu lógica / LLM
+    reply = run_chain(text)
+
+    # 5) Construimos la respuesta en el mismo hilo
+    thread_name = msg.get("thread", {}).get("name")
+    response = {"text": reply}
+    if thread_name:
+        response["thread"] = {"name": thread_name}
+
+    print("DEBUG respuesta a enviar:", response)
+    return response
