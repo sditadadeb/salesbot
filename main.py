@@ -4,36 +4,33 @@ import httpx
 
 app = FastAPI()
 
-# Middleware CORS — esto ahora sí funciona
+# Middleware CORS — OK como está
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción restringí esto
+    allow_origins=["*"],  # En producción, restringí esto
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pegá tu webhook de Google Chat acá (el que generaste en el espacio)
-GOOGLE_CHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAQAwN9u-kA/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=NWNC3za0Mbw2KWs8ctM5kqhaEMkGIzKgD8NL7dJeUos"
+# Tu webhook de respuesta a Google Chat (para RESPONDER desde el bot)
+# (No se usa más en este código — Google espera la respuesta directamente)
+# GOOGLE_CHAT_WEBHOOK = "..."
 
 def run_chain(user_input: str) -> str:
-    """
-    lala aca va a langflow pero ahora es esto para ser felices
-    """
-    return f"Recibí esto: '{user_input}'. (respuesta simulada)"
+    return f"Soy Sales Bot, recibí tu mensaje: \"{user_input}\""
 
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    user_input = data.get("message", "sin mensaje")
 
+    # Extrae el texto del mensaje de Google Chat
+    user_input = data.get("message", {}).get("text", "").strip()
+
+    # Llama a tu lógica
     response_text = run_chain(user_input)
 
-    # Mandar respuesta al webhook de Google Chat
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            GOOGLE_CHAT_WEBHOOK,
-            json={"text": response_text}
-        )
-
-    return {"status": "ok"}
+    # Devuelve la respuesta directamente en el body JSON
+    return {
+        "text": response_text
+    }
