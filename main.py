@@ -17,45 +17,35 @@ def run_chain(user_input: str) -> str:
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        data = await request.json()
-        print("DEBUG payload recibido:", data)
+    data = await request.json()
+    print("DEBUG payload recibido:", data)
 
-        # 2) Extraemos el texto que sigue a la mención (argumentText)
-        text = data.get("message", {}) \
-                   .get("argumentText", "") \
-                   .strip()
-        # fallback si no viniera argumentText
-        if not text:
-            full = data.get("message", {}).get("text", "")
-            # quitamos la mención que va antes del primer espacio
-            text = full.split(" ", 1)[-1].strip()
+    # 2) Extraer payload correcto
+    payload = data.get("messagePayload", {})
+    msg     = payload.get("message", {})
+    space   = payload.get("space", {})
 
-        # 3) Hilo (para mensajes en rooms)
-        thread = data.get("message", {}).get("thread", {})
-        thread_name = thread.get("name")
+    # 3) Texto tras la mención
+    text = msg.get("argumentText", "").strip()
+    if not text:
+        # fallback al texto completo (quita la @mención)
+        full = msg.get("text", "")
+        parts = full.split(" ", 1)
+        text = parts[1].strip() if len(parts) > 1 else ""
 
-        # 4) Generamos la respuesta
-        response_text = run_chain(text)
+    # 4) Construir respuesta
+    resp: dict = {"text": run_chain(text)}
 
-        # 5) Armamos el JSON que Chat espera
-        resp = {
-            "text": response_text,
-            "actionResponse": {"type": "NEW_MESSAGE"}
-        }
-        # si vino con hilo, lo incluimos para que responda ahí
-        if thread_name:
-            resp["thread"] = {"name": thread_name}
+    # 5) Si es DM => NEW_MESSAGE, si es ROOM => usar thread.name
+    if space.get("spaceType") == "DIRECT_MESSAGE" or space.get("singleUserBotDm"):
+        resp["actionResponse"] = {"type": "NEW_MESSAGE"}
+    else:
+        thread = msg.get("thread", {})
+        if thread.get("name"):
+            resp["thread"] = {"name": thread["name"]}
 
-        print("DEBUG respuesta a enviar:", resp)
-        return resp
-
-    except Exception as e:
-        print("ERROR en /webhook:", e)
-        return {
-            "text": "Ocurrió un error interno. Te aviso cuando lo solucione.",
-            "actionResponse": {"type": "NEW_MESSAGE"}
-        }
+    print("DEBUG respuesta a enviar:", resp)
+    return resp
 
 @app.get("/")
 async def root():
