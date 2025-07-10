@@ -1,9 +1,11 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 
 app = FastAPI()
+logging.basicConfig(level=logging.DEBUG)
 
-# CORS (para pruebas desde cualquier frontend)
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,77 +14,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def extract_message_info(data: dict):
-    # Navegamos al objeto message
-    msg = data.get("chat", {}) \
-              .get("messagePayload", {}) \
-              .get("message", {})
-
-    print(">>> [LOG] raw message object:", msg)
-
-    # 1) argumentText (lo que sigue a la mención)
-    raw_arg = msg.get("argumentText")
-    arg = (raw_arg or "").strip()
-    print(f">>> [LOG] raw argumentText: {repr(raw_arg)}")
-
-    # 2) fallback a msg.text
-    if not arg:
-        full = msg.get("text", "") or ""
-        print(f">>> [LOG] raw text: {repr(full)}")
-        parts = full.split(" ", 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-    print(f">>> [LOG] extracted text: {repr(arg)}")
-
-    # 3) thread si viene
-    thread = msg.get("thread", {}).get("name")
-    print(f">>> [LOG] extracted thread name: {repr(thread)}")
-
-    return arg, thread
+def run_chain(user_input: str) -> str:
+    return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
-    print("DEBUG payload recibido:", data)
+    try:
+        payload = await request.json()
+        logging.debug("🔔 Payload recibido: %s", payload)
 
-    # Extraemos texto y thread
-    text, thread = extract_message_info(data)
+        # Extraer datos
+        space = payload["messagePayload"]["space"]
+        msg = payload["messagePayload"]["message"]
+        raw_arg = msg.get("argumentText", "")
+        user_input = raw_arg.strip()
+        logging.debug("   >> raw argumentText: %r", raw_arg)
+        logging.debug("   >> extracted text: %r", user_input)
 
-    # Info del espacio
-    space = data.get("chat", {}) \
-                .get("messagePayload", {}) \
-                .get("space", {})
-    state = space.get("spaceThreadingState")
-    print(f">>> [LOG] spaceThreadingState: {repr(state)}")
+        # Determinar si es DM o ROOM threading
+        is_dm = space["spaceType"] == "DIRECT_MESSAGE"
+        state = space.get("spaceThreadingState")
+        logging.debug("   >> is_dm: %s, spaceThreadingState: %r", is_dm, state)
 
-    # Solo incluimos thread si el espacio soporta threaded messages
-    use_thread = bool(thread and state == "THREADED_MESSAGES")
-    print(f">>> [LOG] include thread in response? {use_thread}")
+        # Construir respuesta
+        reply_text = run_chain(user_input) if user_input else "No entendí tu mensaje."
+        response = {"text": reply_text}
+        logging.debug("   >> base response: %s", response)
 
-    # Si no entendemos nada
-    if not text:
-        resp = {
-            "text": "No entendí tu mensaje. ¿Podés repetirlo?",
-            "actionResponse": {"type": "NEW_MESSAGE"},
-        }
-        if use_thread:
-            resp["thread"] = {"name": thread}
-        print("DEBUG respuesta (repite):", resp)
-        return resp
+        # Solo en ROOMS con hilos incluir thread
+        if not is_dm and state == "THREADED_MESSAGES":
+            thread_name = msg["thread"]["name"]
+            response["thread"] = {"name": thread_name}
+            logging.debug("   >> añadido thread: %r", thread_name)
 
-    # Lógica real (eco)
-    reply = f"Soy Sales Bot, recibí tu mensaje: {text}"
-    print(f">>> [LOG] reply text: {repr(reply)}")
+        # Devolver solo el JSON necesario
+        return response
 
-    # Construimos la respuesta definitiva
-    resp = {
-        "text": reply,
-        "actionResponse": {"type": "NEW_MESSAGE"},
-    }
-    if use_thread:
-        resp["thread"] = {"name": thread}
-
-    print("DEBUG respuesta final a enviar:", resp)
-    return resp
+    except Exception as e:
+        logging.exception("ERROR en /webhook:")
+        return {"text": "Ocurrió un error procesando tu mensaje."}
 
 @app.get("/")
 async def health():
