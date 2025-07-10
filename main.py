@@ -2,18 +2,15 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 
-# ─── Configuración de logging ────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# ─── MIDDLEWARE CORS ──────────────────────────────────────────────────────────
+# CORS (útil para pruebas locales, si no lo necesitas puedes eliminarlo)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # en producción restringe a tu dominio
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,60 +21,42 @@ def run_chain(user_input: str) -> str:
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        payload = await request.json()
-        logging.debug("🔔 Payload completo recibido: %s", payload)
+    payload = await request.json()
+    logger.debug("🔔 Payload completo recibido: %s", payload)
 
-        # ─── Extracción segura de campos ─────────────────────────────────────────
-        chat = payload.get("chat", {})
-        mp   = chat.get("messagePayload", {})
-        space = mp.get("space", {})
-        msg   = mp.get("message", {})
+    # Aseguramos que venga messagePayload con space y message
+    mp = payload.get("messagePayload")
+    if not mp:
+        logger.debug("❗ No hay 'messagePayload' en el payload, retornando vacío.")
+        return {}
 
-        logging.debug("   >> space object: %s", space)
-        logging.debug("   >> raw message object: %s", msg)
+    space = mp.get("space")
+    message = mp.get("message")
+    if not space or not message:
+        logger.debug("❗ Faltan 'space' o 'message' dentro de messagePayload, retornando vacío.")
+        return {}
 
-        # ─── Procesar contenido del mensaje ──────────────────────────────────────
-        raw_arg    = msg.get("argumentText", None)
-        if raw_arg is None:
-            logging.warning("   >> argumentText no encontrado en el mensaje")
-            return {"text": "No entendí tu mensaje (falta argumentText)."}
+    # Extraemos texto ya limpio de la mención
+    user_input = message.get("argumentText", message.get("text", "")).strip()
+    if not user_input:
+        logger.debug("❗ 'argumentText' vacío, pidiendo repetir.")
+        return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-        user_input = raw_arg.strip()
-        logging.debug("   >> raw argumentText: %r", raw_arg)
-        logging.debug("   >> extracted user_input: %r", user_input)
+    # Generamos respuesta
+    reply_text = run_chain(user_input)
+    response = {"text": reply_text}
 
-        # ─── Detectar contexto ───────────────────────────────────────────────────
-        is_dm = space.get("spaceType") == "DIRECT_MESSAGE"
-        threading_state = space.get("spaceThreadingState")
-        logging.debug("   >> is_dm: %s, threading_state: %r", is_dm, threading_state)
+    # Si estamos en un ROOM con threading habilitado, devolvemos en el hilo
+    if space.get("type") == "ROOM" and space.get("spaceThreadingState") == "THREADED_MESSAGES":
+        thread = message.get("thread", {})
+        thread_name = thread.get("name")
+        if thread_name:
+            response["thread"] = {"name": thread_name}
 
-        # ─── Preparar respuesta ──────────────────────────────────────────────────
-        if user_input:
-            reply_text = run_chain(user_input)
-        else:
-            reply_text = "No entendí tu mensaje. ¿Podés repetirlo?"
-        logging.info("   >> reply_text generado: %r", reply_text)
+    logger.debug("✅ Respuesta a enviar: %s", response)
+    return response
 
-        response = {"text": reply_text}
-
-        # ─── Si es ROOM con hilos, incluimos thread en la respuesta ─────────────
-        if not is_dm and threading_state == "THREADED_MESSAGES":
-            thread_obj = msg.get("thread")
-            if thread_obj and "name" in thread_obj:
-                response["thread"] = {"name": thread_obj["name"]}
-                logging.debug("   >> añadido thread.name: %r", thread_obj["name"])
-            else:
-                logging.debug("   >> no se encontró 'thread.name' para adjuntar")
-
-        logging.debug("DEBUG respuesta final a enviar: %s", response)
-        return response
-
-    except Exception as e:
-        logging.exception("❌ ERROR en /webhook:")
-        # Devuelvo 200 OK con mensaje de error para que Google Chat no deshabilite el bot
-        return {"text": "Ocurrió un error interno procesando tu mensaje."}
-
-@app.get("/")
-async def health():
-    return {"status": "ok"}
+if __name__ == "__main__":
+    import os, uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="debug")
