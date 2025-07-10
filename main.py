@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# 1) Middleware CORS (igual que antes)
+# CORS middleware (útil si luego consumís desde otro frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,42 +12,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def run_chain(user_input: str) -> str:
-    # Aquí iría tu llamada a Langflow o LLM
-    return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
+def build_reply(text: str, thread_name: str = None):
+    payload = {
+        "text": text,
+        "actionResponse": {"type": "NEW_MESSAGE"}
+    }
+    if thread_name:
+        payload["thread"] = {"name": thread_name}
+    return payload
 
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
-    # ————————— EXTRACCIÓN CORRECTA —————————
-    chat = data.get("chat", {})
-    mp   = chat.get("messagePayload", {})
-    msg  = mp.get("message", {})
+    # Extraemos el mensaje y el nombre de hilo (si existe)
+    message = data.get("message", {})
+    thread_name = message.get("thread", {}).get("name")
+    user_input = message.get("argumentText", "").strip()
 
-    # 1) Primero tomamos argumentText (lo que viene justo después de la @mención)
-    text = msg.get("argumentText", "") or msg.get("text", "")
-    text = text.strip()
+    # Si no hay texto, preguntamos de nuevo
+    if not user_input:
+        return build_reply("No entendí tu mensaje. ¿Podés repetirlo?", thread_name)
 
-    # 2) Si por algún motivo aún está vacío, pedimos que repita
-    if not text:
-        return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
+    # Tu lógica (por ahora simple eco)
+    response_text = f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
-    # 3) Generamos la respuesta
-    response_text = run_chain(text)
-
-    # 4) Armamos el JSON para que Google Chat publique inline
-    resp = {"text": response_text}
-
-    # 5) Si es un ROOM, devolvemos el mismo thread para publicar ahí
-    thread_name = msg.get("thread", {}).get("name")
-    if thread_name:
-        resp["thread"] = {"name": thread_name}
-
-    print("DEBUG respuesta a enviar:", resp)
-    return resp
+    # Devolvemos la respuesta con hilo y NEW_MESSAGE
+    response = build_reply(response_text, thread_name)
+    print("DEBUG respuesta a enviar:", response)
+    return response
 
 @app.get("/")
-async def root():
+async def health():
     return {"status": "ok"}
