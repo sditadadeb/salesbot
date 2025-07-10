@@ -13,24 +13,19 @@ app.add_middleware(
 )
 
 def extract_message_info(data: dict):
-    """
-    - Devuelve (text, thread_name) extraídos del payload,
-      cubriendo argumento, fallback de text, y extrae thread si existe.
-    """
-    msg = data.get("message") or \
-          data.get("chat", {}) \
+    # Navegamos al objeto message
+    msg = data.get("chat", {}) \
               .get("messagePayload", {}) \
               .get("message", {})
 
-    # LOG raw message object
     print(">>> [LOG] raw message object:", msg)
 
-    # argumento tras la @mención (si aplica)
-    arg = msg.get("argumentText", "") or ""
-    arg = arg.strip()
-    print(f">>> [LOG] raw argumentText: {repr(msg.get('argumentText'))}")
+    # 1) argumentText (lo que sigue a la mención)
+    raw_arg = msg.get("argumentText")
+    arg = (raw_arg or "").strip()
+    print(f">>> [LOG] raw argumentText: {repr(raw_arg)}")
 
-    # fallback a msg.text
+    # 2) fallback a msg.text
     if not arg:
         full = msg.get("text", "") or ""
         print(f">>> [LOG] raw text: {repr(full)}")
@@ -38,7 +33,7 @@ def extract_message_info(data: dict):
         arg = parts[1].strip() if len(parts) > 1 else ""
     print(f">>> [LOG] extracted text: {repr(arg)}")
 
-    # thread (si viene)
+    # 3) thread si viene
     thread = msg.get("thread", {}).get("name")
     print(f">>> [LOG] extracted thread name: {repr(thread)}")
 
@@ -49,28 +44,43 @@ async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
+    # Extraemos texto y thread
     text, thread = extract_message_info(data)
 
-    # Si no hay texto, pedimos al usuario repetir
+    # Info del espacio
+    space = data.get("chat", {}) \
+                .get("messagePayload", {}) \
+                .get("space", {})
+    state = space.get("spaceThreadingState")
+    print(f">>> [LOG] spaceThreadingState: {repr(state)}")
+
+    # Solo incluimos thread si el espacio soporta threaded messages
+    use_thread = bool(thread and state == "THREADED_MESSAGES")
+    print(f">>> [LOG] include thread in response? {use_thread}")
+
+    # Si no entendemos nada
     if not text:
         resp = {
             "text": "No entendí tu mensaje. ¿Podés repetirlo?",
             "actionResponse": {"type": "NEW_MESSAGE"},
-            **({"thread": {"name": thread}} if thread else {})
         }
+        if use_thread:
+            resp["thread"] = {"name": thread}
         print("DEBUG respuesta (repite):", resp)
         return resp
 
-    # Tu lógica: aquí un eco
+    # Lógica real (eco)
     reply = f"Soy Sales Bot, recibí tu mensaje: {text}"
     print(f">>> [LOG] reply text: {repr(reply)}")
 
-    # Armamos la respuesta definitiva, **incluyendo siempre el thread si existe**
+    # Construimos la respuesta definitiva
     resp = {
         "text": reply,
         "actionResponse": {"type": "NEW_MESSAGE"},
-        **({"thread": {"name": thread}} if thread else {})
     }
+    if use_thread:
+        resp["thread"] = {"name": thread}
+
     print("DEBUG respuesta final a enviar:", resp)
     return resp
 
