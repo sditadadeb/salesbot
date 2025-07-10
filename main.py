@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS middleware
+# CORS (para pruebas desde cualquier frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,70 +12,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def extract_text_and_thread(data: dict):
-    chat = data.get("chat", {})
-    mp   = chat.get("messagePayload", {})
-    msg  = mp.get("message", {})
+def extract_message_info(data: dict):
+    """
+    - Devuelve (text, thread_name) extraídos del payload,
+      cubriendo argumento, fallback de text, y extrae thread si existe.
+    """
+    msg = data.get("message") or \
+          data.get("chat", {}) \
+              .get("messagePayload", {}) \
+              .get("message", {})
 
-    print(">>> [LOG] message object:", msg)
+    # LOG raw message object
+    print(">>> [LOG] raw message object:", msg)
 
-    # 1) argumentText primero
-    text = msg.get("argumentText", "") or ""
-    text = text.strip()
-    print(f">>> [LOG] raw argumentText: {repr(msg.get('argumentText', None))}")
+    # argumento tras la @mención (si aplica)
+    arg = msg.get("argumentText", "") or ""
+    arg = arg.strip()
+    print(f">>> [LOG] raw argumentText: {repr(msg.get('argumentText'))}")
 
-    # 2) fallback sobre msg.text
-    if not text:
-        full = msg.get("text", "")
+    # fallback a msg.text
+    if not arg:
+        full = msg.get("text", "") or ""
         print(f">>> [LOG] raw text: {repr(full)}")
         parts = full.split(" ", 1)
-        text = parts[1].strip() if len(parts) > 1 else ""
-    print(f">>> [LOG] extracted text: {repr(text)}")
+        arg = parts[1].strip() if len(parts) > 1 else ""
+    print(f">>> [LOG] extracted text: {repr(arg)}")
 
-    # 3) hilo (thread) para salas
+    # thread (si viene)
     thread = msg.get("thread", {}).get("name")
-    print(f">>> [LOG] extracted thread: {repr(thread)}")
+    print(f">>> [LOG] extracted thread name: {repr(thread)}")
 
-    return text, thread
+    return arg, thread
 
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
-    # Extraemos texto y thread
-    text, thread = extract_text_and_thread(data)
+    text, thread = extract_message_info(data)
 
-    # Info del espacio para distinguir DM vs ROOM
-    space = data.get("chat", {}).get("messagePayload", {}).get("space", {})
-    print(">>> [LOG] space object:", space)
-    is_dm = space.get("type") == "DIRECT_MESSAGE" or space.get("singleUserBotDm", False)
-    print(f">>> [LOG] is_dm: {is_dm}")
-
-    # Si no hay texto, pedimos repetir
+    # Si no hay texto, pedimos al usuario repetir
     if not text:
         resp = {
             "text": "No entendí tu mensaje. ¿Podés repetirlo?",
-            "actionResponse": {"type": "NEW_MESSAGE"}
+            "actionResponse": {"type": "NEW_MESSAGE"},
+            **({"thread": {"name": thread}} if thread else {})
         }
-        if not is_dm and thread:
-            resp["thread"] = {"name": thread}
-        print("DEBUG respuesta a enviar (empty text):", resp)
+        print("DEBUG respuesta (repite):", resp)
         return resp
 
-    # Lógica real (eco)
+    # Tu lógica: aquí un eco
     reply = f"Soy Sales Bot, recibí tu mensaje: {text}"
     print(f">>> [LOG] reply text: {repr(reply)}")
 
-    # Construimos la respuesta final
+    # Armamos la respuesta definitiva, **incluyendo siempre el thread si existe**
     resp = {
         "text": reply,
-        "actionResponse": {"type": "NEW_MESSAGE"}
+        "actionResponse": {"type": "NEW_MESSAGE"},
+        **({"thread": {"name": thread}} if thread else {})
     }
-    if not is_dm and thread:
-        resp["thread"] = {"name": thread}
-
-    print("DEBUG respuesta a enviar:", resp)
+    print("DEBUG respuesta final a enviar:", resp)
     return resp
 
 @app.get("/")
