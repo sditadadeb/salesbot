@@ -1,10 +1,9 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-
 app = FastAPI()
 
-# 1) CORS
+# 1) Middleware CORS (igual que antes)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,6 +13,7 @@ app.add_middleware(
 )
 
 def run_chain(user_input: str) -> str:
+    # Aquí iría tu llamada a Langflow o LLM
     return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
 @app.post("/webhook")
@@ -21,29 +21,29 @@ async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
-    # 2) Extraer payload correcto
-    payload = data.get("messagePayload", {})
-    msg     = payload.get("message", {})
-    space   = payload.get("space", {})
+    # ————————— EXTRACCIÓN CORRECTA —————————
+    chat = data.get("chat", {})
+    mp   = chat.get("messagePayload", {})
+    msg  = mp.get("message", {})
 
-    # 3) Texto tras la mención
-    text = msg.get("argumentText", "").strip()
+    # 1) Primero tomamos argumentText (lo que viene justo después de la @mención)
+    text = msg.get("argumentText", "") or msg.get("text", "")
+    text = text.strip()
+
+    # 2) Si por algún motivo aún está vacío, pedimos que repita
     if not text:
-        # fallback al texto completo (quita la @mención)
-        full = msg.get("text", "")
-        parts = full.split(" ", 1)
-        text = parts[1].strip() if len(parts) > 1 else ""
+        return {"text": "No entendí tu mensaje. ¿Podés repetirlo?"}
 
-    # 4) Construir respuesta
-    resp: dict = {"text": run_chain(text)}
+    # 3) Generamos la respuesta
+    response_text = run_chain(text)
 
-    # 5) Si es DM => NEW_MESSAGE, si es ROOM => usar thread.name
-    if space.get("spaceType") == "DIRECT_MESSAGE" or space.get("singleUserBotDm"):
-        resp["actionResponse"] = {"type": "NEW_MESSAGE"}
-    else:
-        thread = msg.get("thread", {})
-        if thread.get("name"):
-            resp["thread"] = {"name": thread["name"]}
+    # 4) Armamos el JSON para que Google Chat publique inline
+    resp = {"text": response_text}
+
+    # 5) Si es un ROOM, devolvemos el mismo thread para publicar ahí
+    thread_name = msg.get("thread", {}).get("name")
+    if thread_name:
+        resp["thread"] = {"name": thread_name}
 
     print("DEBUG respuesta a enviar:", resp)
     return resp
