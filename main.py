@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS middleware
+# 1) CORS (para pruebas desde cualquier origen)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,38 +12,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def make_response(text: str, thread_name: str = None):
+def extract_text_and_thread(data: dict):
     """
-    Devuelve el dict que Chat espera: text + NEW_MESSAGE + opcional thread
+    Extrae el texto (argumentText o text tras la mención)
+    y el nombre de thread (si existe) de tu payload real.
     """
-    resp = {
-        "text": text,
-        "actionResponse": {"type": "NEW_MESSAGE"}
-    }
-    if thread_name:
-        resp["thread"] = {"name": thread_name}
-    return resp
+    chat = data.get("chat", {})
+    mp   = chat.get("messagePayload", {})
+    msg  = mp.get("message", {})
+
+    # 1) Primero argumentText
+    text = msg.get("argumentText", "") or ""
+    text = text.strip()
+
+    # 2) Fallback: si no hay argumentText, quita el @mención de msg.text
+    if not text:
+        full = msg.get("text", "")
+        parts = full.split(" ", 1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+    
+    # 3) Hilo (solo en rooms)
+    thread = msg.get("thread", {}).get("name")
+    return text, thread
 
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
-    # 1) Extraer el mensaje: cubrimos ambos formatos
-    msg = data.get("message") or data.get("messagePayload", {}).get("message", {})
-    argument = msg.get("argumentText", "").strip()
-    thread = msg.get("thread", {}).get("name")
+    # Extraemos
+    text, thread = extract_text_and_thread(data)
 
-    # 2) Si no viene nada, pedimos que repita
-    if not argument:
-        return make_response("No entendí tu mensaje. ¿Podés repetirlo?", thread)
+    # Si venía vacío, pedimos repetir
+    if not text:
+        resp = {
+            "text": "No entendí tu mensaje. ¿Podés repetirlo?",
+            "actionResponse": {"type": "NEW_MESSAGE"}
+        }
+        if thread:
+            resp["thread"] = {"name": thread}
+        print("DEBUG respuesta a enviar:", resp)
+        return resp
 
-    # 3) Nuestra “lógica” (aquí: un eco)
-    reply = f"Soy Sales Bot, recibí tu mensaje: {argument}"
-    response = make_response(reply, thread)
-    print("DEBUG respuesta a enviar:", response)
-    return response
+    # Aquí tu lógica real → por ahora eco
+    reply = f"Soy Sales Bot, recibí tu mensaje: {text}"
+
+    # Armamos la respuesta que Google Chat publicará inline
+    resp = {
+        "text": reply,
+        "actionResponse": {"type": "NEW_MESSAGE"}
+    }
+    if thread:
+        resp["thread"] = {"name": thread}
+
+    print("DEBUG respuesta a enviar:", resp)
+    return resp
 
 @app.get("/")
-async def root():
+async def health():
     return {"status": "ok"}
