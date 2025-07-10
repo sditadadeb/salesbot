@@ -6,48 +6,53 @@ app = FastAPI()
 def run_chain(user_input: str) -> str:
     return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
-@app.get("/")
-async def healthz():
-    print("🏥 Health check OK")
-    return {"status": "ok"}
-
 @app.post("/webhook")
 async def webhook(request: Request):
-    # 1) Mostrar que llegó algo
-    print("=== /webhook invoked ===")
-    print("Method:", request.method)
-    print("URL   :", request.url)
-
-    # 2) Leer cuerpo crudo y mostrarlo
+    # 1) Leer y loguear el body
     raw = await request.body()
-    try:
-        text_body = raw.decode("utf-8")
-    except:
-        text_body = str(raw)
-    print("Raw body:", text_body)
+    text = raw.decode("utf-8", errors="ignore")
+    print("=== /webhook invocado ===")
+    print("Raw body:", text)
 
-    # 3) Intentar cargar JSON
+    # 2) Parsear JSON
     try:
-        payload = json.loads(text_body)
+        payload = json.loads(text)
     except Exception as e:
-        print("❌ JSON parse error:", e)
-        return {"text": "Error interno: formato inválido"}
-
-    print("Parsed payload:", payload)
-
-    # 4) Extraer mensaje
-    msg = payload.get("messagePayload", {}).get("message") or payload.get("message")
-    if not msg:
-        print("⚠️  No encuentro 'message' en el payload, ignoro.")
+        print("❌ JSON inválido:", e)
         return {}
 
-    # 5) Texto limpio
-    argument = msg.get("argumentText", msg.get("text", "")).strip()
+    # 3) Localizar el contenedor de mensaje (puede estar en payload["messagePayload"] 
+    #    o en payload["chat"]["messagePayload"])
+    msg_container = (
+        payload.get("messagePayload")
+        or payload.get("chat", {}).get("messagePayload")
+        or {}
+    )
+    print("msg_container:", msg_container.keys())
+
+    # 4) Extraer espacio y mensaje
+    space = msg_container.get("space", {})
+    message = msg_container.get("message")
+    if not message:
+        print("⚠️ No encontré 'message' (podría ser un evento de add/remove), ignoro.")
+        return {}
+
+    # 5) Limpiar texto de la @mención
+    argument = message.get("argumentText", message.get("text", "")).strip()
     print("ArgumentText:", repr(argument))
 
     # 6) Generar respuesta
-    reply = run_chain(argument or "<vacío>")
-    print("Reply:", reply)
+    reply_text = run_chain(argument or "<vacío>")
+    print("Respuesta a enviar:", reply_text)
 
-    # 7) Retornar (sin hilos para simplificar)
-    return {"text": reply}
+    # 7) Construir payload de respuesta (sin hilos para simplificar)
+    response = {"text": reply_text}
+
+    # 8) Si es un ROOM con threading, devolvemos en el hilo
+    if space.get("type") == "ROOM" and space.get("spaceThreadingState") == "THREADED_MESSAGES":
+        thread_name = message.get("thread", {}).get("name")
+        if thread_name:
+            response["thread"] = {"name": thread_name}
+            print("→ Respondemos en hilo:", thread_name)
+
+    return response
