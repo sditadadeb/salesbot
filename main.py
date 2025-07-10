@@ -1,58 +1,71 @@
 from fastapi import FastAPI, Request
-import json
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("sales-bot")
 
 app = FastAPI()
 
+# CORS (no es necesario para Google Chat, pero útil para pruebas locales)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def run_chain(user_input: str) -> str:
+    # Aquí tu lógica de negocio / LLM
     return f"Soy Sales Bot, recibí tu mensaje: {user_input}"
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # 1) Leer y loguear el body
-    raw = await request.body()
-    text = raw.decode("utf-8", errors="ignore")
-    print("=== /webhook invocado ===")
-    print("Raw body:", text)
+    payload = await request.json()
+    logger.debug("🔔 Payload completo recibido: %s", payload)
 
-    # 2) Parsear JSON
-    try:
-        payload = json.loads(text)
-    except Exception as e:
-        print("❌ JSON inválido:", e)
-        return {}
+    # 1) Normalizar estructura: usar messagePayload si existe
+    event = payload.get("messagePayload", payload)
+    space = event.get("space") or payload.get("space", {})
+    message = event.get("message") or payload.get("message")
 
-    # 3) Localizar el contenedor de mensaje (puede estar en payload["messagePayload"] 
-    #    o en payload["chat"]["messagePayload"])
-    msg_container = (
-        payload.get("messagePayload")
-        or payload.get("chat", {}).get("messagePayload")
-        or {}
-    )
-    print("msg_container:", msg_container.keys())
-
-    # 4) Extraer espacio y mensaje
-    space = msg_container.get("space", {})
-    message = msg_container.get("message")
+    # 2) Si no hay mensaje, salimos sin responder
     if not message:
-        print("⚠️ No encontré 'message' (podría ser un evento de add/remove), ignoro.")
+        logger.debug("❗ No hay campo 'message' en el payload, ignorando evento.")
         return {}
 
-    # 5) Limpiar texto de la @mención
-    argument = message.get("argumentText", message.get("text", "")).strip()
-    print("ArgumentText:", repr(argument))
+    # 3) Extraer texto limpio, hilo y tipo de espacio
+    raw_text = message.get("text", "")
+    argument = message.get("argumentText", raw_text).strip()
 
-    # 6) Generar respuesta
-    reply_text = run_chain(argument or "<vacío>")
-    print("Respuesta a enviar:", reply_text)
+    thread = message.get("thread", {})
+    thread_name = thread.get("name")
 
-    # 7) Construir payload de respuesta (sin hilos para simplificar)
-    response = {"text": reply_text}
+    is_dm = space.get("type") == "DIRECT_MESSAGE"
+    threading_state = space.get("spaceThreadingState")
 
-    # 8) Si es un ROOM con threading, devolvemos en el hilo
-    if space.get("type") == "ROOM" and space.get("spaceThreadingState") == "THREADED_MESSAGES":
-        thread_name = message.get("thread", {}).get("name")
-        if thread_name:
-            response["thread"] = {"name": thread_name}
-            print("→ Respondemos en hilo:", thread_name)
+    logger.debug("   >> espacio: %s", space)
+    logger.debug("   >> mensaje: %s", message)
+    logger.debug("   >> texto tras limpiar mención: '%s'", argument)
+    logger.debug("   >> is_dm=%s, threading_state=%s, thread_name=%s",
+                 is_dm, threading_state, thread_name)
 
-    return response
+    # 4) Generar respuesta
+    response_text = run_chain(argument or "<vacío>")
+    response_payload = {
+        "text": response_text,
+        "actionResponse": {"type": "NEW_MESSAGE"}
+    }
+
+    # 5) Si estamos en un ROOM con hilos, enviamos la respuesta dentro del hilo
+    if not is_dm and threading_state == "THREADED_MESSAGES" and thread_name:
+        response_payload["thread"] = {"name": thread_name}
+
+    logger.debug("⚙️ Respuesta a enviar: %s", response_payload)
+    return response_payload
+
+if __name__ == "__main__":
+    import os, uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="debug")
