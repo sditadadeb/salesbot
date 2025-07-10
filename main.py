@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# 1) CORS (para pruebas desde cualquier origen)
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,25 +13,29 @@ app.add_middleware(
 )
 
 def extract_text_and_thread(data: dict):
-    """
-    Extrae el texto del usuario y el hilo (si es una sala).
-    """
     chat = data.get("chat", {})
     mp   = chat.get("messagePayload", {})
     msg  = mp.get("message", {})
 
-    # 1) argumentText es lo que sigue a la mención
+    print(">>> [LOG] message object:", msg)
+
+    # 1) argumentText primero
     text = msg.get("argumentText", "") or ""
     text = text.strip()
+    print(f">>> [LOG] raw argumentText: {repr(msg.get('argumentText', None))}")
 
-    # 2) Si está vacío, quita la @mención de msg.text
+    # 2) fallback sobre msg.text
     if not text:
         full = msg.get("text", "")
+        print(f">>> [LOG] raw text: {repr(full)}")
         parts = full.split(" ", 1)
         text = parts[1].strip() if len(parts) > 1 else ""
+    print(f">>> [LOG] extracted text: {repr(text)}")
 
-    # 3) Hilo (solo relevante en salas)
+    # 3) hilo (thread) para salas
     thread = msg.get("thread", {}).get("name")
+    print(f">>> [LOG] extracted thread: {repr(thread)}")
+
     return text, thread
 
 @app.post("/webhook")
@@ -39,32 +43,35 @@ async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
+    # Extraemos texto y thread
     text, thread = extract_text_and_thread(data)
-    space = data.get("chat", {}).get("messagePayload", {}).get("space", {})
-    is_dm = space.get("type") == "DIRECT_MESSAGE" or space.get("singleUserBotDm")
 
-    # Si no entendemos nada
+    # Info del espacio para distinguir DM vs ROOM
+    space = data.get("chat", {}).get("messagePayload", {}).get("space", {})
+    print(">>> [LOG] space object:", space)
+    is_dm = space.get("type") == "DIRECT_MESSAGE" or space.get("singleUserBotDm", False)
+    print(f">>> [LOG] is_dm: {is_dm}")
+
+    # Si no hay texto, pedimos repetir
     if not text:
         resp = {
             "text": "No entendí tu mensaje. ¿Podés repetirlo?",
             "actionResponse": {"type": "NEW_MESSAGE"}
         }
-        # En sala, mantenemos el hilo
         if not is_dm and thread:
             resp["thread"] = {"name": thread}
-        print("DEBUG respuesta a enviar:", resp)
+        print("DEBUG respuesta a enviar (empty text):", resp)
         return resp
 
-    # Tu lógica real va aquí. Ahora, un eco simple:
+    # Lógica real (eco)
     reply = f"Soy Sales Bot, recibí tu mensaje: {text}"
+    print(f">>> [LOG] reply text: {repr(reply)}")
 
-    # Construimos la respuesta que Google Chat mostrará
+    # Construimos la respuesta final
     resp = {
         "text": reply,
         "actionResponse": {"type": "NEW_MESSAGE"}
     }
-
-    # Solo en sala incluimos thread; en DM NO
     if not is_dm and thread:
         resp["thread"] = {"name": thread}
 
