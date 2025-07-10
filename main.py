@@ -5,7 +5,8 @@ import logging
 app = FastAPI()
 logging.basicConfig(level=logging.DEBUG)
 
-# CORS middleware
+# ─── MIDDLEWARE CORS ──────────────────────────────────────────────────────────
+# Permite peticiones desde cualquier origen (útil en desarrollo)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,34 +24,40 @@ async def webhook(request: Request):
         payload = await request.json()
         logging.debug("🔔 Payload recibido: %s", payload)
 
-        # Extraer datos
-        space = payload["messagePayload"]["space"]
-        msg = payload["messagePayload"]["message"]
-        raw_arg = msg.get("argumentText", "")
+        # Ojo: el messagePayload está anidado en payload["chat"]
+        mp = payload.get("chat", {}).get("messagePayload", {})
+        space = mp.get("space", {})
+        msg   = mp.get("message", {})
+
+        logging.debug("   >> space object: %s", space)
+        logging.debug("   >> raw message object: %s", msg)
+
+        # Extraemos el argumento tras la mención
+        raw_arg    = msg.get("argumentText", "")
         user_input = raw_arg.strip()
         logging.debug("   >> raw argumentText: %r", raw_arg)
         logging.debug("   >> extracted text: %r", user_input)
 
-        # Determinar si es DM o ROOM threading
-        is_dm = space["spaceType"] == "DIRECT_MESSAGE"
+        # Detectar DM vs ROOM con hilos
+        is_dm = space.get("spaceType") == "DIRECT_MESSAGE"
         state = space.get("spaceThreadingState")
         logging.debug("   >> is_dm: %s, spaceThreadingState: %r", is_dm, state)
 
-        # Construir respuesta
+        # Construir texto de respuesta
         reply_text = run_chain(user_input) if user_input else "No entendí tu mensaje."
         response = {"text": reply_text}
-        logging.debug("   >> base response: %s", response)
 
-        # Solo en ROOMS con hilos incluir thread
+        # Sólo en ROOMS con hilos incluyo thread para responder en el hilo
         if not is_dm and state == "THREADED_MESSAGES":
-            thread_name = msg["thread"]["name"]
-            response["thread"] = {"name": thread_name}
-            logging.debug("   >> añadido thread: %r", thread_name)
+            thread_name = msg.get("thread", {}).get("name")
+            if thread_name:
+                response["thread"] = {"name": thread_name}
+                logging.debug("   >> añadido thread: %r", thread_name)
 
-        # Devolver solo el JSON necesario
+        logging.debug("DEBUG respuesta final a enviar: %s", response)
         return response
 
-    except Exception as e:
+    except Exception:
         logging.exception("ERROR en /webhook:")
         return {"text": "Ocurrió un error procesando tu mensaje."}
 
