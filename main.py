@@ -14,24 +14,23 @@ app.add_middleware(
 
 def extract_text_and_thread(data: dict):
     """
-    Extrae el texto (argumentText o text tras la mención)
-    y el nombre de thread (si existe) de tu payload real.
+    Extrae el texto del usuario y el hilo (si es una sala).
     """
     chat = data.get("chat", {})
     mp   = chat.get("messagePayload", {})
     msg  = mp.get("message", {})
 
-    # 1) Primero argumentText
+    # 1) argumentText es lo que sigue a la mención
     text = msg.get("argumentText", "") or ""
     text = text.strip()
 
-    # 2) Fallback: si no hay argumentText, quita el @mención de msg.text
+    # 2) Si está vacío, quita la @mención de msg.text
     if not text:
         full = msg.get("text", "")
         parts = full.split(" ", 1)
         text = parts[1].strip() if len(parts) > 1 else ""
-    
-    # 3) Hilo (solo en rooms)
+
+    # 3) Hilo (solo relevante en salas)
     thread = msg.get("thread", {}).get("name")
     return text, thread
 
@@ -40,29 +39,33 @@ async def webhook(request: Request):
     data = await request.json()
     print("DEBUG payload recibido:", data)
 
-    # Extraemos
     text, thread = extract_text_and_thread(data)
+    space = data.get("chat", {}).get("messagePayload", {}).get("space", {})
+    is_dm = space.get("type") == "DIRECT_MESSAGE" or space.get("singleUserBotDm")
 
-    # Si venía vacío, pedimos repetir
+    # Si no entendemos nada
     if not text:
         resp = {
             "text": "No entendí tu mensaje. ¿Podés repetirlo?",
             "actionResponse": {"type": "NEW_MESSAGE"}
         }
-        if thread:
+        # En sala, mantenemos el hilo
+        if not is_dm and thread:
             resp["thread"] = {"name": thread}
         print("DEBUG respuesta a enviar:", resp)
         return resp
 
-    # Aquí tu lógica real → por ahora eco
+    # Tu lógica real va aquí. Ahora, un eco simple:
     reply = f"Soy Sales Bot, recibí tu mensaje: {text}"
 
-    # Armamos la respuesta que Google Chat publicará inline
+    # Construimos la respuesta que Google Chat mostrará
     resp = {
         "text": reply,
         "actionResponse": {"type": "NEW_MESSAGE"}
     }
-    if thread:
+
+    # Solo en sala incluimos thread; en DM NO
+    if not is_dm and thread:
         resp["thread"] = {"name": thread}
 
     print("DEBUG respuesta a enviar:", resp)
