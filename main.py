@@ -7,10 +7,10 @@ logger = logging.getLogger("sales-bot")
 
 app = FastAPI()
 
-# ➊ CORS habilitado para permitir pruebas desde cualquier origen
+# ➊ Habilita CORS para pruebas (ajusta en prod)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # en prod, restringe aquí a tus dominios
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,28 +24,27 @@ async def webhook(request: Request):
     payload = await request.json()
     logger.debug("🔔 Payload completo recibido: %s", payload)
 
-    # ➋ Extraer siempre chat.messagePayload si existe
+    # ➋ Extrae siempre chat.messagePayload
     chat = payload.get("chat", {})
     mp = chat.get("messagePayload")
     if mp:
         space   = mp.get("space", {})
         message = mp.get("message", {})
     else:
-        # Fallback para otros casos
         mp = payload.get("messagePayload", {})
         space   = mp.get("space", {}) or payload.get("space", {})
         message = mp.get("message", {}) or payload.get("message", {})
 
-    # ➌ Si no tenemos un mensaje, respondemos 200 OK sin cuerpo
+    # ➌ Si no hay mensaje, devuelvo 200 OK vacío
     if not message:
         logger.debug("❗ No hay campo 'message' en el payload, ignorando evento.")
         return {}
 
-    # ➍ Limpiar la @mención
+    # ➍ Limpia la @mención
     raw_text = message.get("text", "")
     argument = message.get("argumentText", raw_text).strip()
 
-    # ➎ Detectar hilo y DM
+    # ➎ Detecta hilo y DM
     thread      = message.get("thread", {})
     thread_name = thread.get("name")
     is_dm       = space.get("type") == "DIRECT_MESSAGE"
@@ -56,11 +55,14 @@ async def webhook(request: Request):
     logger.debug("   >> texto limpio: '%s'", argument)
     logger.debug("   >> is_dm=%s, threading_state=%s, thread_name=%s", is_dm, threading, thread_name)
 
-    # ➏ Generar respuesta
+    # ➏ Genera respuesta
     response_text = run_chain(argument or "<vacío>")
-    response_payload = {"text": response_text}
 
-    # ➐ Si estamos en ROOM y con hilos, respondemos en el mismo hilo
+    # ➒ Construye el payload de respuesta (el “arreglo” que pide Google Chat)
+    response_payload = {
+        "text": response_text,
+    }
+    # si es ROOM + threaded, responde en hilo
     if not is_dm and threading == "THREADED_MESSAGES" and thread_name:
         response_payload["thread"] = {"name": thread_name}
 
