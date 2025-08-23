@@ -54,7 +54,9 @@ function authorizeWithSavedToken() {
 authorizeWithSavedToken();
 loadSeenMessages();
 
-// 🔁 Polling para leer mensajes
+let lastCheck = Date.now();
+
+// 🔁 Polling para leer mensajes nuevos desde última revisión
 async function pollForMessages() {
   if (!process.env.SPACE_ID) {
     console.warn("⚠️ No se configuró SPACE_ID");
@@ -62,16 +64,18 @@ async function pollForMessages() {
   }
 
   try {
-    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages`;
+    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages?pageSize=50`; // limitar y ordenar
     const res = await oAuth2Client.request({ url });
     const messages = res.data.messages || [];
 
-    for (const msg of messages) {
+    for (const msg of messages.reverse()) { // orden cronológico
+      const name = msg.name;
       const text = msg.text;
       const senderEmail = msg.sender?.email;
-      const name = msg.name;
+      const timestamp = new Date(msg.createTime).getTime();
 
       if (!text || seenMessages.has(name) || senderEmail === 'bot@numia.co') continue;
+      if (timestamp <= lastCheck) continue;
 
       console.log(`💬 Nuevo mensaje: "${text}" de ${senderEmail}`);
       seenMessages.add(name);
@@ -87,6 +91,8 @@ async function pollForMessages() {
 
       console.log('📤 Respuesta enviada');
     }
+
+    lastCheck = Date.now();
 
   } catch (error) {
     console.error("❌ Error en polling de mensajes:", error.message || error);
