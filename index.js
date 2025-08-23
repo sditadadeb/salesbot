@@ -8,12 +8,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SCOPES = [
-  'https://www.googleapis.com/auth/chat.bot',
   'https://www.googleapis.com/auth/chat.messages',
-   'https://www.googleapis.com/auth/chat.spaces',
-  'https://www.googleapis.com/auth/chat.spaces.readonly',
-    'https://www.googleapis.com/auth/chat.memberships',
-  'https://www.googleapis.com/auth/chat.messages.readonly'
+  'https://www.googleapis.com/auth/chat.messages.readonly',
+  'https://www.googleapis.com/auth/chat.spaces',
+  'https://www.googleapis.com/auth/chat.memberships.readonly'
 ];
 
 const oAuth2Client = new google.auth.OAuth2(
