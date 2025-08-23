@@ -1,32 +1,32 @@
 const express = require('express');
 const { google } = require('googleapis');
-const open = require('open');
 const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 const SCOPES = [
   'https://www.googleapis.com/auth/chat.messages',
-  'https://www.googleapis.com/auth/chat.messages.readonly',
   'https://www.googleapis.com/auth/chat.spaces',
-  'https://www.googleapis.com/auth/chat.memberships.readonly'
+  'https://www.googleapis.com/auth/chat.memberships.readonly',
 ];
 
 const oAuth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  `https://bot-con-credencial.onrender.com/oauth2callback`
+  `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/oauth2callback`
 );
 
-let chat; // Google Chat API client
+let chat; // Cliente de Google Chat
 
+// Intenta leer el token desde archivo
 function authorizeWithSavedToken() {
   try {
     const token = fs.readFileSync('token.json');
     oAuth2Client.setCredentials(JSON.parse(token));
     chat = google.chat({ version: 'v1', auth: oAuth2Client });
+    console.log("✅ Bot autenticado con token guardado");
   } catch (err) {
     console.log("❌ Token no encontrado. Ir a /auth para iniciar sesión");
   }
@@ -34,8 +34,10 @@ function authorizeWithSavedToken() {
 
 authorizeWithSavedToken();
 
+// Rutas
+
 app.get('/', (req, res) => {
-  res.send('Servidor funcionando. Ir a /auth para autenticarse.');
+  res.send('🟢 Bot corriendo. Ir a /auth para autenticarse.');
 });
 
 app.get('/auth', (req, res) => {
@@ -49,30 +51,30 @@ app.get('/auth', (req, res) => {
 
 app.get('/oauth2callback', async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.status(400).send('No se recibió código.');
+  if (!code) return res.status(400).send('No se recibió código');
+
   try {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
     fs.writeFileSync('token.json', JSON.stringify(tokens));
     chat = google.chat({ version: 'v1', auth: oAuth2Client });
+    console.log("✅ Token guardado correctamente");
     res.send('✅ Autenticación exitosa. Ya podés usar el bot.');
   } catch (error) {
     console.error('❌ Error al intercambiar código:', error);
-    res.status(500).send('Error al autenticar.');
+    res.status(500).send('Error al autenticar');
   }
 });
 
 app.get('/send', async (req, res) => {
-  const spaceName = req.query.space; // eg: spaces/AAA... (space ID)
+  const spaceName = req.query.space; // Ejemplo: spaces/AAA...
   const text = req.query.text || 'Hola desde el bot!';
   if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
 
   try {
     const response = await chat.spaces.messages.create({
       parent: spaceName,
-      requestBody: {
-        text,
-      },
+      requestBody: { text },
     });
     res.send(`✅ Mensaje enviado a ${spaceName}: ${text}`);
   } catch (error) {
@@ -92,16 +94,23 @@ app.get('/spaces', async (req, res) => {
   }
 });
 
-app.get('/messages', async (req, res) => {
-  const spaceName = req.query.space;
-  if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
-  try {
-    const response = await chat.spaces.messages.list({ parent: spaceName });
-    res.json(response.data.messages || []);
-  } catch (error) {
-    console.error('❌ Error al leer mensajes:', error);
-    res.status(500).send('Error al leer mensajes');
+// Endpoint que recibe eventos (DM o @mención)
+app.post('/events', express.json(), (req, res) => {
+  const event = req.body;
+  console.log("📩 Evento recibido:", JSON.stringify(event, null, 2));
+
+  const message = event.message?.argumentText || event.message?.text || '';
+  const thread = event.message?.thread?.name;
+
+  if (message) {
+    const response = {
+      text: `✅ Recibido: "${message}"`,
+      ...(thread && { thread: { name: thread } })
+    };
+    return res.json(response);
   }
+
+  res.json({ text: "⚠️ No se recibió mensaje de texto." });
 });
 
 app.listen(PORT, () => {
