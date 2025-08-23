@@ -1,38 +1,49 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const app = express();
 
+const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.use(bodyParser.json());
 
-app.get('/', (req, res) => {
-  res.send('Bot operativo ✅');
-});
-
 app.post('/', (req, res) => {
   console.log('📥 Evento recibido:', JSON.stringify(req.body, null, 2));
 
-  const message = req.body?.chat?.messagePayload?.message;
-  const thread = message?.thread?.name;
-  const text = message?.text || message?.argumentText || '';
+  const message = req.body?.chat?.message;
+  const space = message?.space;
+  const spaceType = space?.spaceType;
+  const messageText = message?.text;
 
-  if (!message) {
+  if (!messageText) {
     console.warn('⚠️ Ignorando evento sin mensaje.');
-    return res.status(200).send();
+    return res.status(200).send(); // Respondemos 200 igual para evitar errores en Google Chat
   }
 
-  const respuesta = {
-    text: `recibido. tu mensaje fue: "${text.trim()}"`
-  };
+  const responseText = `recibido. tu mensaje fue: "${messageText}"`;
 
-  if (thread) {
-    respuesta.thread = { name: thread };
+  // Si es un mensaje directo (DM), no incluimos thread
+  if (spaceType === 'DIRECT_MESSAGE') {
+    console.log('📤 Respondiendo en DM:', responseText);
+    return res.json({
+      text: responseText
+    });
   }
 
-  console.log('📤 Respondiendo:', JSON.stringify(respuesta, null, 2));
-  res.setHeader('Content-Type', 'application/json');
-  res.status(200).json(respuesta);
+  // Si es un espacio (grupo), respondemos en el mismo thread
+  if (spaceType === 'SPACE' || spaceType === 'ROOM') {
+    const threadName = message?.thread?.name;
+    console.log('📤 Respondiendo en espacio:', responseText, 'Thread:', threadName);
+
+    return res.json({
+      text: responseText,
+      thread: {
+        name: threadName
+      }
+    });
+  }
+
+  console.warn('⚠️ Tipo de espacio no reconocido:', spaceType);
+  res.status(200).send();
 });
 
 app.listen(PORT, () => {
