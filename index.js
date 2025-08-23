@@ -64,20 +64,38 @@ async function pollForMessages() {
   }
 
   try {
-    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages?pageSize=50`; // limitar y ordenar
+    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages`;
+    console.log(`📡 Llamando a: ${url}`);
+    
     const res = await oAuth2Client.request({ url });
-    const messages = res.data.messages || [];
 
-    for (const msg of messages.reverse()) { // orden cronológico
-      const name = msg.name;
+    const messages = res.data.messages || [];
+    console.log(`📨 ${messages.length} mensajes recibidos`);
+
+    for (const msg of messages) {
       const text = msg.text;
       const senderEmail = msg.sender?.email;
-      const timestamp = new Date(msg.createTime).getTime();
+      const name = msg.name;
 
-      if (!text || seenMessages.has(name) || senderEmail === 'bot@numia.co') continue;
-      if (timestamp <= lastCheck) continue;
+      console.log(`➡️ Analizando mensaje:`, { name, text, senderEmail });
 
-      console.log(`💬 Nuevo mensaje: "${text}" de ${senderEmail}`);
+      if (!text) {
+        console.log('⛔ Ignorado: texto vacío');
+        continue;
+      }
+
+      if (seenMessages.has(name)) {
+        console.log(`⛔ Ignorado: ya procesado (${name})`);
+        continue;
+      }
+
+      if (senderEmail === 'bot@numia.co') {
+        console.log('⛔ Ignorado: enviado por el bot');
+        continue;
+      }
+
+      console.log(`💬 Nuevo mensaje válido: "${text}" de ${senderEmail}`);
+
       seenMessages.add(name);
       saveSeenMessages();
 
@@ -92,12 +110,11 @@ async function pollForMessages() {
       console.log('📤 Respuesta enviada');
     }
 
-    lastCheck = Date.now();
-
   } catch (error) {
     console.error("❌ Error en polling de mensajes:", error.message || error);
   }
 }
+
 
 setInterval(() => {
   console.log('🔄 Polling ejecutado...');
