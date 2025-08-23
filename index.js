@@ -18,113 +18,91 @@ const oAuth2Client = new google.auth.OAuth2(
   `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/oauth2callback`
 );
 
-let chat; // Cliente de Google Chat
+let chat;
+let lastTimestamp = null;
 
-// 🧠 Persistencia de mensajes vistos
-const SEEN_FILE = 'seen.json';
-let seenMessages = new Set();
-
-function loadSeenMessages() {
-  try {
-    const data = fs.readFileSync(SEEN_FILE, 'utf-8');
-    const ids = JSON.parse(data);
-    seenMessages = new Set(ids);
-    console.log(`📁 Mensajes leídos cargados (${ids.length})`);
-  } catch {
-    console.log("📁 No hay historial de mensajes leídos, comenzando desde cero");
-  }
-}
-
-function saveSeenMessages() {
-  fs.writeFileSync(SEEN_FILE, JSON.stringify([...seenMessages]), 'utf-8');
-}
-
-// 🔐 Autenticación con token local
+// =======================
+// 🔐 Autenticación
+// =======================
 function authorizeWithSavedToken() {
   try {
     const token = fs.readFileSync('token.json');
     oAuth2Client.setCredentials(JSON.parse(token));
     chat = google.chat({ version: 'v1', auth: oAuth2Client });
-    console.log("✅ Bot autenticado con token guardado");
-  } catch (err) {
-    console.log("❌ Token no encontrado. Ir a /auth para iniciar sesión");
+    console.log("✅ Bot autenticado correctamente");
+  } catch {
+    console.log("❌ Token no encontrado. Ir a /auth para autenticar");
   }
 }
 
-authorizeWithSavedToken();
-loadSeenMessages();
+// =======================
+// 🕒 Timestamp persistente
+// =======================
+const TIMESTAMP_FILE = 'last_seen.json';
 
-let lastCheck = Date.now();
+function loadLastTimestamp() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TIMESTAMP_FILE, 'utf-8'));
+    lastTimestamp = data.lastSeen;
+    console.log(`🕓 Último mensaje visto: ${lastTimestamp}`);
+  } catch {
+    console.log("🕓 No hay timestamp previo, iniciando desde cero");
+    lastTimestamp = null;
+  }
+}
 
-// 🔁 Polling para leer mensajes nuevos desde última revisión
+function saveLastTimestamp(ts) {
+  fs.writeFileSync(TIMESTAMP_FILE, JSON.stringify({ lastSeen: ts }), 'utf-8');
+  lastTimestamp = ts;
+}
+
+// =======================
+// 🔁 Polling de mensajes nuevos
+// =======================
 async function pollForMessages() {
   if (!process.env.SPACE_ID) {
-    console.warn("⚠️ No se configuró SPACE_ID");
+    console.warn("⚠️ Falta SPACE_ID en .env");
     return;
   }
 
   try {
     const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages`;
-    console.log(`📡 Llamando a: ${url}`);
-    
     const res = await oAuth2Client.request({ url });
-
     const messages = res.data.messages || [];
-    console.log(`📨 ${messages.length} mensajes recibidos`);
 
-    for (const msg of messages) {
-      const text = msg.text;
-      const senderEmail = msg.sender?.email;
-      const name = msg.name;
+    for (const msg of messages.reverse()) {  // más antiguos primero
+      const { text, sender, createTime, name, thread } = msg;
 
-      console.log(`➡️ Analizando mensaje:`, { name, text, senderEmail });
+      if (!text || sender?.email === 'bot@numia.co') continue;
+      if (lastTimestamp && createTime <= lastTimestamp) continue;
 
-      if (!text) {
-        console.log('⛔ Ignorado: texto vacío');
-        continue;
-      }
-
-      if (seenMessages.has(name)) {
-        console.log(`⛔ Ignorado: ya procesado (${name})`);
-        continue;
-      }
-
-      if (senderEmail === 'bot@numia.co') {
-        console.log('⛔ Ignorado: enviado por el bot');
-        continue;
-      }
-
-      console.log(`💬 Nuevo mensaje válido: "${text}" de ${senderEmail}`);
-
-      seenMessages.add(name);
-      saveSeenMessages();
+      console.log(`📩 Nuevo mensaje: "${text}" de ${sender?.email} (${createTime})`);
 
       await chat.spaces.messages.create({
         parent: process.env.SPACE_ID,
         requestBody: {
           text: `✅ Recibido: "${text}"`,
-          thread: msg.thread ? { name: msg.thread.name } : undefined,
+          ...(thread ? { thread: { name: thread.name } } : {})
         },
       });
 
-      console.log('📤 Respuesta enviada');
+      console.log("📤 Respuesta enviada");
+      saveLastTimestamp(createTime);
     }
 
   } catch (error) {
-    console.error("❌ Error en polling de mensajes:", error.message || error);
+    console.error("❌ Error en polling:", error.message || error);
   }
 }
 
-
 setInterval(() => {
-  console.log('🔄 Polling ejecutado...');
+  console.log('🔄 Ejecutando polling...');
   pollForMessages();
 }, 5000);
 
-// ======================
+// =======================
 // Rutas públicas
-// ======================
-
+// =======================
 app.get('/', (req, res) => {
   res.send('🟢 Bot corriendo. Ir a /auth para autenticarse.');
 });
@@ -150,40 +128,11 @@ app.get('/oauth2callback', async (req, res) => {
     console.log("✅ Token guardado correctamente");
     res.send('✅ Autenticación exitosa. Ya podés usar el bot.');
   } catch (error) {
-    console.error('❌ Error al intercambiar código:', error);
+    console.error('❌ Error al autenticar:', error);
     res.status(500).send('Error al autenticar');
   }
 });
 
-app.get('/send', async (req, res) => {
-  const spaceName = req.query.space;
-  const text = req.query.text || 'Hola desde el bot!';
-  if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
-
-  try {
-    await chat.spaces.messages.create({
-      parent: spaceName,
-      requestBody: { text },
-    });
-    res.send(`✅ Mensaje enviado a ${spaceName}: ${text}`);
-  } catch (error) {
-    console.error("❌ Error al enviar mensaje:", error);
-    res.status(500).send("Error al enviar mensaje");
-  }
-});
-
-app.get('/spaces', async (req, res) => {
-  try {
-    const result = await chat.spaces.list();
-    const spaces = result.data.spaces || [];
-    res.json(spaces);
-  } catch (error) {
-    console.error("❌ Error al listar spaces:", error);
-    res.status(500).send("Error al obtener spaces");
-  }
-});
-
-// ======================
 app.listen(PORT, () => {
   console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
 });
