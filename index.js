@@ -78,7 +78,7 @@ async function pollForMessages() {
   }
 }
 
-setInterval(pollForMessages, 10000); // cada 10 segundos
+setInterval(pollForMessages, 3000); // cada 10 segundos
 
 // ======================
 // Rutas
