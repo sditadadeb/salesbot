@@ -1,85 +1,133 @@
+// index.js
 const express = require('express');
+const bodyParser = require('body-parser');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Asegurá que parseamos JSON
-app.use(express.json());
+// --- Middleware -------------------------------------------------------------
+app.set('trust proxy', true);
+app.use(bodyParser.json({ limit: '1mb' }));
 
-// Salud
-app.get('/healthz', (_req, res) => res.status(200).send('ok'));
-
-// Utilidad: extrae el "message" y el "space" soportando esquemas distintos
-function extractMessageAndSpace(body) {
-  // Esquema “oficial” de Google Chat App
-  if (body && body.message) {
-    return { message: body.message, space: body.space || body.message.space };
-  }
-  // Esquema que viste en tus logs (chat.messagePayload)
-  if (body && body.chat && body.chat.messagePayload) {
-    return {
-      message: body.chat.messagePayload.message,
-      space: body.chat.messagePayload.space
-    };
-  }
-  // Fallback
-  return { message: undefined, space: undefined };
-}
-
-// Endpoint principal de eventos
-app.post('/events', (req, res) => {
-  console.log('📥 Evento completo recibido:\n', JSON.stringify(req.body, null, 2));
-
-  const { message, space } = extractMessageAndSpace(req.body);
-
-  // Si no hay mensaje (p.ej. added_to_space, removed_from_space)
-  const topType = req.body.type || req.body.eventType; // por si viene en otro campo
-  if (!message) {
-    // Mensaje de bienvenida cuando agregan el bot a un espacio/DM
-    if (topType === 'ADDED_TO_SPACE' || req.body?.chat?.type === 'ADDED_TO_SPACE') {
-      const isDm =
-        (space?.type === 'DM') ||
-        (space?.spaceType === 'DIRECT_MESSAGE') ||
-        (req.body?.space?.type === 'DM');
-      const text = isDm
-        ? '¡Hola! Soy el bot. Escribime y te respondo 🙂'
-        : '¡Gracias por invitarme! Mencioname con @<bot> y te respondo 🙂';
-      return res.json({ text });
-    }
-
-    console.warn('⚠️ Evento sin message. Respondemos 200 vacío.');
-    return res.status(200).send(); // Siempre 200 para que Chat no reintente
-  }
-
-  // Texto: usar argumentText si te mencionan, si no, usar text
-  const text =
-    (message.argumentText && message.argumentText.trim()) ||
-    (message.text && message.text.trim()) ||
-    '';
-
-  if (!text) {
-    console.warn('⚠️ Ignorando evento sin texto.');
-    return res.status(200).send();
-  }
-
-  const isDm =
-    (space?.type === 'DM') ||
-    (space?.spaceType === 'DIRECT_MESSAGE') ||
-    (message?.space?.type === 'DM') ||
-    (message?.space?.spaceType === 'DIRECT_MESSAGE');
-
-  const reply = { text: `recibido. tu mensaje fue: "${text}"` };
-
-  // En espacios, respondemos en el mismo thread
-  if (!isDm && message.thread?.name) {
-    reply.thread = { name: message.thread.name };
-  }
-
-  console.log('📤 Respuesta que enviamos:', reply);
-  return res.json(reply); // responder en línea (sync). Debe ser <10s
+// Log de todas las requests (método, path, UA, headers clave)
+app.use((req, _res, next) => {
+  console.log('────────────────────────────────────────────────────────');
+  console.log(`📨 ${req.method} ${req.originalUrl}`);
+  console.log(`🧑‍💻 IP: ${req.ip} | UA: ${req.headers['user-agent']}`);
+  console.log(`🔖 Content-Type: ${req.headers['content-type']}`);
+  next();
 });
 
-// Arranque
+// --- Utilidades -------------------------------------------------------------
+
+/**
+ * Normaliza el evento para extraer texto, spaceType y threadName
+ * Soporta:
+ *  1) Formato clásico de Chat bots: { type, message, space, user, ... }
+ *  2) Formato nuevo (lo que viste): { commonEventObject, chat:{ messagePayload:{ message, space, ... } } }
+ */
+function extractMessageInfo(body) {
+  // 1) Formato clásico
+  if (body && (body.type || body.message)) {
+    const space = body.space || body.message?.space;
+    const spaceType = space?.type || space?.spaceType; // algunos envían "SPACE"/"ROOM" vs "DM"/"DIRECT_MESSAGE"
+    const text = body.message?.argumentText || body.message?.text || '';
+    const threadName = body.message?.thread?.name;
+    return {
+      text,
+      spaceType,
+      threadName,
+      rawSpace: space,
+    };
+  }
+
+  // 2) Formato nuevo (el que tenías en logs con "commonEventObject" y "chat.messagePayload")
+  const msg = body?.chat?.messagePayload?.message;
+  const space = body?.chat?.messagePayload?.space;
+  if (msg || space) {
+    const text = msg?.argumentText || msg?.text || body?.chat?.messagePayload?.argumentText || '';
+    const spaceType = space?.spaceType || space?.type;
+    const threadName = msg?.thread?.name;
+    return {
+      text,
+      spaceType,
+      threadName,
+      rawSpace: space,
+    };
+  }
+
+  // 3) Nada reconocible
+  return { text: '', spaceType: undefined, threadName: undefined, rawSpace: undefined };
+}
+
+/**
+ * Decide si es DM (mensaje directo) según los campos que pueda traer cada formato.
+ */
+function isDirect(spaceType, rawSpace) {
+  if (!spaceType && rawSpace?.singleUserBotDm) return true;
+  const t = (spaceType || '').toUpperCase();
+  return t === 'DM' || t === 'DIRECT_MESSAGE';
+}
+
+/**
+ * Arma el texto "recibido..." sanitizado.
+ */
+function buildEcho(text) {
+  const trimmed = String(text || '').trim();
+  return `recibido. tu mensaje fue: "${trimmed}"`;
+}
+
+// --- Rutas ------------------------------------------------------------------
+
+app.get('/', (_req, res) => {
+  res.status(200).send('🟢 Webhook de Google Chat OK. Usa POST /events');
+});
+
+// Healthcheck opcional (algunos balanceadores lo piden)
+app.get('/_ah/health', (_req, res) => res.status(200).send('ok'));
+
+/**
+ * Endpoint que recibe eventos de Google Chat
+ * Configurá esta URL en: Google Chat API → Configuración → Activadores → URL de extremo HTTP → https://TU-RENDER.onrender.com/events
+ */
+app.post('/events', (req, res) => {
+  try {
+    console.log('📥 Cuerpo recibido:\n', JSON.stringify(req.body, null, 2));
+
+    const { text, spaceType, threadName, rawSpace } = extractMessageInfo(req.body);
+    console.log(`🔎 Normalizado → text="${text}", spaceType="${spaceType}", thread="${threadName}"`);
+
+    if (!text) {
+      console.warn('⚠️ Evento sin texto/argumentText. Respondo 200 sin cuerpo.');
+      return res.status(200).send(); // importante: 200 para que Chat no reintente
+    }
+
+    const responseText = buildEcho(text);
+
+    // Decidir respuesta: si es DM, respondemos plano; si es espacio, respondemos en el mismo hilo
+    let responseBody;
+    if (isDirect(spaceType, rawSpace)) {
+      responseBody = { text: responseText };
+      console.log('📤 Respondiendo (DM):', JSON.stringify(responseBody));
+      return res.status(200).json(responseBody);
+    }
+
+    // Espacio/room/space → intentar responder en el mismo hilo si existe
+    responseBody = threadName
+      ? { text: responseText, thread: { name: threadName } }
+      : { text: responseText };
+
+    console.log('📤 Respondiendo (SPACE):', JSON.stringify(responseBody));
+    return res.status(200).json(responseBody);
+  } catch (err) {
+    console.error('💥 Error manejando evento:', err);
+    // Aun con error, devolvemos 200 para evitar reintentos infinitos
+    return res.status(200).send();
+  }
+});
+
+// --- Arranque ---------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`🚀 Bot de Chat por eventos escuchando en puerto ${PORT}`);
+  console.log(`🚀 Bot escuchando en puerto ${PORT}`);
+  console.log(`👉 Configurá Google Chat API → Activadores → URL: https://<tu-dominio-render>/events`);
 });
