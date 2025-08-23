@@ -20,7 +20,7 @@ const oAuth2Client = new google.auth.OAuth2(
 
 let chat; // Cliente de Google Chat
 
-// Intenta leer el token desde archivo
+// Intenta leer token guardado
 function authorizeWithSavedToken() {
   try {
     const token = fs.readFileSync('token.json');
@@ -34,7 +34,56 @@ function authorizeWithSavedToken() {
 
 authorizeWithSavedToken();
 
-// Rutas de autenticación
+// ======================
+// Polling para leer y responder mensajes
+// ======================
+
+const seenMessages = new Set();
+
+async function pollForMessages() {
+  if (!process.env.SPACE_ID) {
+    console.warn("⚠️ No se configuró SPACE_ID");
+    return;
+  }
+
+  try {
+    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages`;
+    const res = await oAuth2Client.request({ url });
+    const messages = res.data.messages || [];
+
+    for (const msg of messages) {
+      const text = msg.text;
+      const senderEmail = msg.sender?.email;
+      const name = msg.name;
+
+      if (!text || seenMessages.has(name) || senderEmail === 'bot@numia.co') continue;
+
+      console.log(`💬 Nuevo mensaje: "${text}" de ${senderEmail}`);
+      seenMessages.add(name);
+
+      // Responder
+      await chat.spaces.messages.create({
+        parent: process.env.SPACE_ID,
+        requestBody: {
+          text: `✅ Recibido: "${text}"`,
+          thread: msg.thread ? { name: msg.thread.name } : undefined,
+        },
+      });
+
+      console.log('📤 Respuesta enviada');
+    }
+
+  } catch (error) {
+    console.error("❌ Error en polling de mensajes:", error.message || error);
+  }
+}
+
+setInterval(pollForMessages, 10000); // cada 10 segundos
+
+// ======================
+// Rutas
+// ======================
+
 app.get('/', (req, res) => {
   res.send('🟢 Bot corriendo. Ir a /auth para autenticarse.');
 });
@@ -65,7 +114,6 @@ app.get('/oauth2callback', async (req, res) => {
   }
 });
 
-// Endpoint para enviar mensaje manual
 app.get('/send', async (req, res) => {
   const spaceName = req.query.space; // Ejemplo: spaces/AAA...
   const text = req.query.text || 'Hola desde el bot!';
@@ -83,7 +131,6 @@ app.get('/send', async (req, res) => {
   }
 });
 
-// Endpoint para ver los spaces a los que pertenece
 app.get('/spaces', async (req, res) => {
   try {
     const result = await chat.spaces.list();
@@ -95,48 +142,7 @@ app.get('/spaces', async (req, res) => {
   }
 });
 
-// ================== POLLING AUTOMÁTICO ==================
-const lastTimestamps = {};
-
-async function pollMessages() {
-  const spaceId = process.env.SPACE_ID;
-  if (!spaceId || !chat) return;
-
-  try {
-    const response = await chat.spaces.messages.list({ parent: spaceId });
-    const messages = response.data.messages || [];
-
-    for (const msg of messages.reverse()) {
-      const senderEmail = msg.sender?.email;
-      const text = msg.text;
-      const time = msg.createTime;
-
-      if (
-        !text ||
-        senderEmail === 'bot@numia.co' ||
-        (lastTimestamps[spaceId] && time <= lastTimestamps[spaceId])
-      ) continue;
-
-      lastTimestamps[spaceId] = time;
-
-      console.log(`📩 Nuevo mensaje en ${spaceId}: ${text} (de ${senderEmail})`);
-
-      await chat.spaces.messages.create({
-        parent: spaceId,
-        requestBody: {
-          text: `✅ Recibido: "${text}"`
-        }
-      });
-
-      console.log(`📤 Respondido a ${senderEmail}`);
-    }
-  } catch (err) {
-    console.error('❌ Error en polling de mensajes:', err.message);
-  }
-}
-
-setInterval(pollMessages, 10000); // cada 10s
-
+// ======================
 app.listen(PORT, () => {
-  console.log(`🚀 Bot escuchando en puerto ${PORT}`);
+  console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
 });
