@@ -18,8 +18,9 @@ const oAuth2Client = new google.auth.OAuth2(
   `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/oauth2callback`
 );
 
-let chat;
+let chat; // Cliente de Google Chat
 
+// Intenta leer el token desde archivo
 function authorizeWithSavedToken() {
   try {
     const token = fs.readFileSync('token.json');
@@ -33,6 +34,7 @@ function authorizeWithSavedToken() {
 
 authorizeWithSavedToken();
 
+// Rutas de autenticación
 app.get('/', (req, res) => {
   res.send('🟢 Bot corriendo. Ir a /auth para autenticarse.');
 });
@@ -63,8 +65,9 @@ app.get('/oauth2callback', async (req, res) => {
   }
 });
 
+// Endpoint para enviar mensaje manual
 app.get('/send', async (req, res) => {
-  const spaceName = req.query.space;
+  const spaceName = req.query.space; // Ejemplo: spaces/AAA...
   const text = req.query.text || 'Hola desde el bot!';
   if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
 
@@ -80,6 +83,7 @@ app.get('/send', async (req, res) => {
   }
 });
 
+// Endpoint para ver los spaces a los que pertenece
 app.get('/spaces', async (req, res) => {
   try {
     const result = await chat.spaces.list();
@@ -91,42 +95,48 @@ app.get('/spaces', async (req, res) => {
   }
 });
 
-// 🆕 Endpoint que responde a mensajes entrantes
-app.post('/events', express.json(), (req, res) => {
-  const event = req.body;
+// ================== POLLING AUTOMÁTICO ==================
+const lastTimestamps = {};
 
-  console.log("📥 Evento completo recibido:\n", JSON.stringify(event, null, 2));
+async function pollMessages() {
+  const spaceId = process.env.SPACE_ID;
+  if (!spaceId || !chat) return;
 
-  const messageText = event.message?.argumentText || event.message?.text;
-  const space = event.space;
-  const thread = event.message?.thread?.name;
-  const spaceType = space?.spaceType || space?.type;
-  const sender = event.message?.sender?.displayName || 'usuario';
+  try {
+    const response = await chat.spaces.messages.list({ parent: spaceId });
+    const messages = response.data.messages || [];
 
-  if (!messageText) {
-    console.warn("⚠️ Ignorando evento sin texto");
-    return res.json({ text: "⚠️ No se recibió mensaje de texto." });
+    for (const msg of messages.reverse()) {
+      const senderEmail = msg.sender?.email;
+      const text = msg.text;
+      const time = msg.createTime;
+
+      if (
+        !text ||
+        senderEmail === 'bot@numia.co' ||
+        (lastTimestamps[spaceId] && time <= lastTimestamps[spaceId])
+      ) continue;
+
+      lastTimestamps[spaceId] = time;
+
+      console.log(`📩 Nuevo mensaje en ${spaceId}: ${text} (de ${senderEmail})`);
+
+      await chat.spaces.messages.create({
+        parent: spaceId,
+        requestBody: {
+          text: `✅ Recibido: "${text}"`
+        }
+      });
+
+      console.log(`📤 Respondido a ${senderEmail}`);
+    }
+  } catch (err) {
+    console.error('❌ Error en polling de mensajes:', err.message);
   }
+}
 
-  const replyText = `✅ Recibido, ${sender}. Tu mensaje fue: "${messageText}"`;
-
-  if (spaceType === 'DIRECT_MESSAGE') {
-    console.log("✉️ Respondemos en DM:", replyText);
-    return res.json({ text: replyText });
-  }
-
-  if (spaceType === 'ROOM' || spaceType === 'SPACE') {
-    console.log("✉️ Respondemos en espacio:", replyText, "Thread:", thread);
-    return res.json({
-      text: replyText,
-      thread: thread ? { name: thread } : undefined
-    });
-  }
-
-  console.warn("❗ Tipo de espacio no reconocido:", spaceType);
-  res.status(200).send(); // Evita error de Google Chat
-});
+setInterval(pollMessages, 10000); // cada 10s
 
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
+  console.log(`🚀 Bot escuchando en puerto ${PORT}`);
 });
