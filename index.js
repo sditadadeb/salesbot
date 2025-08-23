@@ -1,20 +1,18 @@
 const express = require('express');
 const app = express();
-
 app.use(express.json());
 
-// Ruta principal que responde a Google Chat
 app.post('/', (req, res) => {
-  const { message } = req.body;
-
-  if (message && message.text) {
-    console.log('Mensaje recibido:', message.text);
-  }
+  const text = req.body.message?.text || '';
+  console.log('Mensaje recibido:', text);
 
   res.json({
-    text: 'recibido'
+    text: `recibido. tu mensaje fue: "${text}"`
   });
 });
 
+// 🔥 ESTA PARTE ES CRUCIAL EN RENDER
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot corriendo en puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Bot escuchando en puerto ${PORT}`);
+});
