@@ -18,80 +18,66 @@ const oAuth2Client = new google.auth.OAuth2(
   `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/oauth2callback`
 );
 
-let chat;
-let lastTimestamp = null;
+let chat; // Cliente de Google Chat
 
-// =======================
-// 🔐 Autenticación
-// =======================
+// 🧠 Timestamp de última lectura
+let lastTimestamp = new Date(0).toISOString(); // Epoch al inicio
+
+// 🔐 Autenticación con token local
 function authorizeWithSavedToken() {
   try {
     const token = fs.readFileSync('token.json');
     oAuth2Client.setCredentials(JSON.parse(token));
     chat = google.chat({ version: 'v1', auth: oAuth2Client });
-    console.log("✅ Bot autenticado correctamente");
-  } catch {
-    console.log("❌ Token no encontrado. Ir a /auth para autenticar");
+    console.log("✅ Bot autenticado con token guardado");
+  } catch (err) {
+    console.log("❌ Token no encontrado. Ir a /auth para iniciar sesión");
   }
 }
 
-// =======================
-// 🕒 Timestamp persistente
-// =======================
-const TIMESTAMP_FILE = 'last_seen.json';
+authorizeWithSavedToken();
 
-function loadLastTimestamp() {
-  try {
-    const data = JSON.parse(fs.readFileSync(TIMESTAMP_FILE, 'utf-8'));
-    lastTimestamp = data.lastSeen;
-    console.log(`🕓 Último mensaje visto: ${lastTimestamp}`);
-  } catch {
-    console.log("🕓 No hay timestamp previo, iniciando desde cero");
-    lastTimestamp = null;
-  }
-}
-
-function saveLastTimestamp(ts) {
-  fs.writeFileSync(TIMESTAMP_FILE, JSON.stringify({ lastSeen: ts }), 'utf-8');
-  lastTimestamp = ts;
-}
-
-// =======================
-// 🔁 Polling de mensajes nuevos
-// =======================
+// 🔁 Polling para leer mensajes nuevos
 async function pollForMessages() {
   if (!process.env.SPACE_ID) {
-    console.warn("⚠️ Falta SPACE_ID en .env");
+    console.warn("⚠️ No se configuró SPACE_ID");
     return;
   }
 
   try {
-    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages`;
+    const url = `https://chat.googleapis.com/v1/${process.env.SPACE_ID}/messages?pageSize=50`;
     const res = await oAuth2Client.request({ url });
     const messages = res.data.messages || [];
 
-    for (const msg of messages.reverse()) {  // más antiguos primero
-      const { text, sender, createTime, name, thread } = msg;
+    for (const msg of messages.reverse()) {
+      const text = msg.text;
+      const senderEmail = msg.sender?.email;
+      const created = msg.createTime;
+      const name = msg.name;
 
-      if (!text || sender?.email === 'bot@numia.co') continue;
-      if (lastTimestamp && createTime <= lastTimestamp) continue;
+      if (!text || senderEmail === 'bot@numia.co') continue;
 
-      console.log(`📩 Nuevo mensaje: "${text}" de ${sender?.email} (${createTime})`);
+      if (new Date(created) <= new Date(lastTimestamp)) {
+        console.log(`⏭ Mensaje viejo ignorado: ${name}`);
+        continue;
+      }
+
+      console.log(`💬 Nuevo mensaje: "${text}" de ${senderEmail} (${created})`);
+      lastTimestamp = created;
 
       await chat.spaces.messages.create({
         parent: process.env.SPACE_ID,
         requestBody: {
           text: `✅ Recibido: "${text}"`,
-          ...(thread ? { thread: { name: thread.name } } : {})
+          thread: msg.thread ? { name: msg.thread.name } : undefined,
         },
       });
 
-      console.log("📤 Respuesta enviada");
-      saveLastTimestamp(createTime);
+      console.log('📤 Respuesta enviada');
     }
 
   } catch (error) {
-    console.error("❌ Error en polling:", error.message || error);
+    console.error("❌ Error en polling de mensajes:", error.message || error);
   }
 }
 
@@ -100,9 +86,10 @@ setInterval(() => {
   pollForMessages();
 }, 5000);
 
-// =======================
+// ======================
 // Rutas públicas
-// =======================
+// ======================
+
 app.get('/', (req, res) => {
   res.send('🟢 Bot corriendo. Ir a /auth para autenticarse.');
 });
@@ -128,11 +115,40 @@ app.get('/oauth2callback', async (req, res) => {
     console.log("✅ Token guardado correctamente");
     res.send('✅ Autenticación exitosa. Ya podés usar el bot.');
   } catch (error) {
-    console.error('❌ Error al autenticar:', error);
+    console.error('❌ Error al intercambiar código:', error);
     res.status(500).send('Error al autenticar');
   }
 });
 
+app.get('/send', async (req, res) => {
+  const spaceName = req.query.space;
+  const text = req.query.text || 'Hola desde el bot!';
+  if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
+
+  try {
+    await chat.spaces.messages.create({
+      parent: spaceName,
+      requestBody: { text },
+    });
+    res.send(`✅ Mensaje enviado a ${spaceName}: ${text}`);
+  } catch (error) {
+    console.error("❌ Error al enviar mensaje:", error);
+    res.status(500).send("Error al enviar mensaje");
+  }
+});
+
+app.get('/spaces', async (req, res) => {
+  try {
+    const result = await chat.spaces.list();
+    const spaces = result.data.spaces || [];
+    res.json(spaces);
+  } catch (error) {
+    console.error("❌ Error al listar spaces:", error);
+    res.status(500).send("Error al obtener spaces");
+  }
+});
+
+// ======================
 app.listen(PORT, () => {
   console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
 });
