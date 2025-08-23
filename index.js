@@ -3,46 +3,52 @@ const app = express();
 
 app.use(express.json());
 
-// Ruta GET para comprobar que el bot está vivo
+// Ruta de prueba GET
 app.get('/', (req, res) => {
-  res.send('🤖 Bot de Google Chat activo y escuchando');
+  res.send('🤖 Bot de Google Chat activo y esperando mensajes');
 });
 
-// Ruta POST para manejar eventos desde Google Chat
+// Ruta principal para eventos desde Google Chat
 app.post('/', (req, res) => {
   const body = req.body;
 
   console.log('📥 Evento recibido:', JSON.stringify(body, null, 2));
 
-  // Detectar si hay texto en alguna estructura válida
+  // Extraer el texto del mensaje desde diferentes estructuras posibles
   const rawText =
     body.message?.text ||
     body.chat?.messagePayload?.message?.text;
 
   if (!rawText) {
     console.log('⚠️ No hay texto en el mensaje. Ignorando evento.');
-    return res.status(200).send(); // No respondemos si no hay texto
+    return res.status(200).send();
   }
 
-  // Eliminar la mención al bot si viene de grupo (ej: "@botSales hola")
+  // Limpiar mención al bot si viene de grupo
   const cleanText = rawText.replace(/^@\w+\s*/, '').trim();
 
-  // Obtener nombre del remitente
+  // Obtener el nombre del remitente
   const user =
     body.message?.sender?.displayName ||
     body.chat?.user?.displayName ||
     'usuario desconocido';
 
-  // Construir la respuesta
+  // Detectar el hilo si el mensaje vino desde un hilo (espacio grupal)
+  const threadName =
+    body.message?.thread?.name ||
+    body.chat?.messagePayload?.message?.thread?.name;
+
+  // Armar la respuesta
   const respuesta = {
-    text: `recibido. tu mensaje fue: "${cleanText}"`
+    text: `recibido. tu mensaje fue: "${cleanText}"`,
+    ...(threadName && { thread: { name: threadName } }) // Incluir hilo solo si existe
   };
 
   console.log(`📤 Respondiendo a ${user}:`, respuesta);
-  res.json(respuesta); // Enviar la respuesta a Google Chat
+  res.json(respuesta);
 });
 
-// Escuchar en el puerto asignado por Render
+// Puerto para Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Bot escuchando en puerto ${PORT}`);
