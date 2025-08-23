@@ -20,7 +20,26 @@ const oAuth2Client = new google.auth.OAuth2(
 
 let chat; // Cliente de Google Chat
 
-// Intenta leer token guardado
+// 🧠 Persistencia de mensajes vistos
+const SEEN_FILE = 'seen.json';
+let seenMessages = new Set();
+
+function loadSeenMessages() {
+  try {
+    const data = fs.readFileSync(SEEN_FILE, 'utf-8');
+    const ids = JSON.parse(data);
+    seenMessages = new Set(ids);
+    console.log(`📁 Mensajes leídos cargados (${ids.length})`);
+  } catch {
+    console.log("📁 No hay historial de mensajes leídos, comenzando desde cero");
+  }
+}
+
+function saveSeenMessages() {
+  fs.writeFileSync(SEEN_FILE, JSON.stringify([...seenMessages]), 'utf-8');
+}
+
+// 🔐 Autenticación con token local
 function authorizeWithSavedToken() {
   try {
     const token = fs.readFileSync('token.json');
@@ -33,13 +52,9 @@ function authorizeWithSavedToken() {
 }
 
 authorizeWithSavedToken();
+loadSeenMessages();
 
-// ======================
-// Polling para leer y responder mensajes
-// ======================
-
-const seenMessages = new Set();
-
+// 🔁 Polling para leer mensajes
 async function pollForMessages() {
   if (!process.env.SPACE_ID) {
     console.warn("⚠️ No se configuró SPACE_ID");
@@ -60,8 +75,8 @@ async function pollForMessages() {
 
       console.log(`💬 Nuevo mensaje: "${text}" de ${senderEmail}`);
       seenMessages.add(name);
+      saveSeenMessages();
 
-      // Responder
       await chat.spaces.messages.create({
         parent: process.env.SPACE_ID,
         requestBody: {
@@ -78,10 +93,13 @@ async function pollForMessages() {
   }
 }
 
-setInterval(pollForMessages, 3000); // cada 10 segundos
+setInterval(() => {
+  console.log('🔄 Polling ejecutado...');
+  pollForMessages();
+}, 5000);
 
 // ======================
-// Rutas
+// Rutas públicas
 // ======================
 
 app.get('/', (req, res) => {
@@ -115,12 +133,12 @@ app.get('/oauth2callback', async (req, res) => {
 });
 
 app.get('/send', async (req, res) => {
-  const spaceName = req.query.space; // Ejemplo: spaces/AAA...
+  const spaceName = req.query.space;
   const text = req.query.text || 'Hola desde el bot!';
   if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
 
   try {
-    const response = await chat.spaces.messages.create({
+    await chat.spaces.messages.create({
       parent: spaceName,
       requestBody: { text },
     });
