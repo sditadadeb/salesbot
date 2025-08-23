@@ -1,98 +1,109 @@
-const express = require("express");
-const { google } = require("googleapis");
-const fs = require("fs");
-const path = require("path");
+""const express = require('express');
+const { google } = require('googleapis');
+const open = require('open');
+const fs = require('fs');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Variables de entorno
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI;
+const SCOPES = [
+  'https://www.googleapis.com/auth/chat.bot',
+  'https://www.googleapis.com/auth/chat.messages',
+  'https://www.googleapis.com/auth/chat.spaces.readonly',
+  'https://www.googleapis.com/auth/chat.messages.readonly'
+];
 
-if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
-  console.error("❌ Faltan variables de entorno: CLIENT_ID, CLIENT_SECRET o REDIRECT_URI");
-  process.exit(1);
-}
-
-// Inicializa cliente OAuth2
 const oAuth2Client = new google.auth.OAuth2(
-  CLIENT_ID,
-  CLIENT_SECRET,
-  REDIRECT_URI
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  `https://bot-con-credencial.onrender.com/oauth2callback`
 );
 
-const TOKEN_PATH = path.join(__dirname, "token.json");
+let chat; // Google Chat API client
 
-// Intenta cargar el token desde archivo
-function loadToken() {
-  if (fs.existsSync(TOKEN_PATH)) {
-    const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
-    oAuth2Client.setCredentials(token);
-    console.log("✅ Token cargado");
-    return true;
-  } else {
-    console.log("📭 No hay token.json aún. Visitá /auth para autorizar.");
-    return false;
+function authorizeWithSavedToken() {
+  try {
+    const token = fs.readFileSync('token.json');
+    oAuth2Client.setCredentials(JSON.parse(token));
+    chat = google.chat({ version: 'v1', auth: oAuth2Client });
+  } catch (err) {
+    console.log("❌ Token no encontrado. Ir a /auth para iniciar sesión");
   }
 }
 
-// Ruta para iniciar autenticación
-app.get("/auth", (req, res) => {
-  const SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/chat.bot",
-    "https://www.googleapis.com/auth/chat.messages",
-    "https://www.googleapis.com/auth/chat.messages.create"
-  ];
+authorizeWithSavedToken();
 
-  const authUrl = oAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: SCOPES,
-    prompt: "consent"
-  });
-
-  res.redirect(authUrl);
+app.get('/', (req, res) => {
+  res.send('Servidor funcionando. Ir a /auth para autenticarse.');
 });
 
-// Callback de OAuth
-app.get("/auth/callback", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send("Falta el código de autorización.");
+app.get('/auth', (req, res) => {
+  const url = oAuth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: SCOPES,
+    prompt: 'consent'
+  });
+  res.redirect(url);
+});
 
+app.get('/oauth2callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send('No se recibió código.');
   try {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
-    console.log("✅ Token guardado en token.json");
-    res.send("Autenticación completada. Podés cerrar esta pestaña.");
-  } catch (err) {
-    console.error("❌ Error al obtener token:", err);
-    res.status(500).send("Error al obtener el token.");
+    fs.writeFileSync('token.json', JSON.stringify(tokens));
+    chat = google.chat({ version: 'v1', auth: oAuth2Client });
+    res.send('✅ Autenticación exitosa. Ya podés usar el bot.');
+  } catch (error) {
+    console.error('❌ Error al intercambiar código:', error);
+    res.status(500).send('Error al autenticar.');
   }
 });
 
-// Ruta de prueba protegida (usá esto para probar lectura Gmail u otros)
-app.get("/test", async (req, res) => {
-  if (!fs.existsSync(TOKEN_PATH)) {
-    return res.send("Token no encontrado. Visitá /auth primero.");
-  }
+app.get('/send', async (req, res) => {
+  const spaceName = req.query.space; // eg: spaces/AAA... (space ID)
+  const text = req.query.text || 'Hola desde el bot!';
+  if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
 
   try {
-    const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
-    const result = await gmail.users.messages.list({ userId: "me", maxResults: 5 });
-
-    res.send(result.data.messages || "No hay mensajes.");
-  } catch (err) {
-    console.error("❌ Error al llamar a Gmail API:", err);
-    res.status(500).send("Error al usar Gmail API.");
+    const response = await chat.spaces.messages.create({
+      parent: spaceName,
+      requestBody: {
+        text,
+      },
+    });
+    res.send(`✅ Mensaje enviado a ${spaceName}: ${text}`);
+  } catch (error) {
+    console.error("❌ Error al enviar mensaje:", error);
+    res.status(500).send("Error al enviar mensaje");
   }
 });
 
-// Inicia servidor
+app.get('/spaces', async (req, res) => {
+  try {
+    const result = await chat.spaces.list();
+    const spaces = result.data.spaces || [];
+    res.json(spaces);
+  } catch (error) {
+    console.error("❌ Error al listar spaces:", error);
+    res.status(500).send("Error al obtener spaces");
+  }
+});
+
+app.get('/messages', async (req, res) => {
+  const spaceName = req.query.space;
+  if (!spaceName) return res.status(400).send('Falta parámetro ?space=');
+  try {
+    const response = await chat.spaces.messages.list({ parent: spaceName });
+    res.json(response.data.messages || []);
+  } catch (error) {
+    console.error('❌ Error al leer mensajes:', error);
+    res.status(500).send('Error al leer mensajes');
+  }
+});
+
 app.listen(PORT, () => {
-  loadToken();
-  console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
+  console.log(`Servidor escuchando en http://localhost:${PORT}`);
 });
