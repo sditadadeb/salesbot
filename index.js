@@ -19,12 +19,14 @@ const oAuth2Client = new google.auth.OAuth2(
 
 // Ruta para iniciar la autenticación
 app.get("/auth", async (req, res) => {
-  const authUrl = oAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/chat"],
-    prompt: "consent",
-  });
-  res.redirect(authUrl);
+ const authUrl = oAuth2Client.generateAuthUrl({
+  access_type: "offline",
+  prompt: "consent",
+  scope: [
+    "https://www.googleapis.com/auth/chat",              // ✅ acceso a Google Chat como usuario real
+    "https://www.googleapis.com/auth/userinfo.email",   // para saber qué usuario autorizó
+    "https://www.googleapis.com/auth/userinfo.profile"  // para mostrar nombre/avatar si querés
+  ]
 });
 
 // Ruta para recibir el token tras autorizar
