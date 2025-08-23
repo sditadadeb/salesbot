@@ -4,9 +4,12 @@ const open = require("open");
 const fs = require("fs");
 const app = express();
 
-const CLIENT_ID = "TU_CLIENT_ID";
-const CLIENT_SECRET = "TU_CLIENT_SECRET";
-const REDIRECT_URI = "http://localhost:3000/oauth2callback";
+
+
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+
+const REDIRECT_URI = "https://salesbot-2.onrender.com"; // o el dominio que Render te dé
 const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 let tokenPath = "token.json";
