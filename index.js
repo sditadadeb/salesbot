@@ -1,39 +1,48 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-
 const app = express();
+
+// Puerto que Render usará (por defecto 10000 en tu caso)
 const PORT = process.env.PORT || 10000;
 
 app.use(bodyParser.json());
 
+// Ruta raíz para saludos o test
+app.get('/', (req, res) => {
+  res.send('Bot operativo ✅');
+});
+
+// Ruta principal para eventos desde Google Chat
 app.post('/', (req, res) => {
-  const body = req.body;
+  console.log('📥 Evento recibido:', JSON.stringify(req.body, null, 2));
 
-  console.log('📥 Evento recibido:', JSON.stringify(body, null, 2));
-
-  // Tipo de evento
-  const message = body?.chat?.message;
+  const message = req.body?.chat?.message;
   const thread = message?.thread?.name;
-  const text = message?.argumentText || message?.text || '';
-  const sender = message?.sender?.displayName || 'usuario';
+  const text = message?.text || message?.argumentText || '';
 
-  const response = {
-    text: `recibido. tu mensaje fue: "${text}"`,
-  };
-
-  if (thread) {
-    response.thread = { name: thread };
+  // Verificamos que es un mensaje válido
+  if (!message) {
+    console.warn('⚠️ Ignorando evento sin mensaje.');
+    return res.status(200).send(); // Respondemos sin contenido
   }
 
-  console.log('📤 Respondiendo con:', response);
-  res.status(200).json(response);
+  // Preparamos respuesta
+  const respuesta = {
+    text: `recibido. tu mensaje fue: "${text.trim()}"`
+  };
+
+  // Si hay thread (en espacios), lo incluimos en la respuesta
+  if (thread) {
+    respuesta.thread = { name: thread };
+  }
+
+  console.log('📤 Enviando respuesta:', JSON.stringify(respuesta, null, 2));
+
+  res.setHeader('Content-Type', 'application/json');
+  res.status(200).json(respuesta);
 });
 
-// Endpoint opcional para pruebas
-app.get('/', (req, res) => {
-  res.send('✅ Bot en línea');
-});
-
+// Iniciar servidor
 app.listen(PORT, () => {
-  console.log(`Bot escuchando en puerto ${PORT}`);
+  console.log(`🚀 Bot escuchando en puerto ${PORT}`);
 });
