@@ -4,70 +4,51 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Parseo JSON del webhook
+// Parseo JSON del webhook (obligatorio para leer el evento)
 app.use(express.json());
 
-// Health
+// Healthcheck
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-// Webhook principal de Google Chat
+// Webhook principal: configurar esta URL en TODOS los activadores de Google Chat
+// (Mensaje, Comando de la app, Se agregó al espacio, Se quitó del espacio)
 app.post("/events", (req, res) => {
-  const body = req.body;
-
-  // --- Logging opcional (no bloquear la respuesta)
+  // Log liviano (no bloquear la respuesta)
   try {
     console.log("📨 POST /events");
-    console.log("📥 Cuerpo:", JSON.stringify(body, null, 2));
-  } catch (_) {}
+    console.log("📥 Body:", JSON.stringify(req.body));
+  } catch {}
 
-  // Extraer datos clave del evento
-  const msg = body?.chat?.messagePayload?.message;
-  const space = body?.chat?.messagePayload?.space;
+  // Extraer el mensaje desde el payload de Chat
+  const msg = req.body?.chat?.messagePayload?.message;
 
-  // Si no hay mensaje (p.ej. ADDED_TO_SPACE), saludamos
+  // Si no hay mensaje (p. ej., ADDED_TO_SPACE), responder saludo corto
   if (!msg) {
-    const reply = {
+    const welcome = {
       text:
-        "¡Gracias por invitarme! Escribime algo (mencionándome en salas) y te respondo con “recibido”.",
-      messageReplyOption: "REPLY_MESSAGE_FALLBACK",
+        '¡Gracias por invitarme! Mencioname en el espacio (ej: "@botSales hola") y te respondo con "recibido".',
     };
     return res
       .status(200)
-      .set("Content-Type", "application/json; charset=utf-8")
-      .send(reply);
+      .type("application/json; charset=UTF-8")
+      .send(JSON.stringify(welcome));
   }
 
-  // Para salas, Google entrega:
-  // - message.text (incluye la mención)
-  // - message.argumentText (texto SIN la mención) -> preferido
-  const textRaw =
-    msg.argumentText?.trim() ||
-    msg.formattedText?.trim() ||
-    msg.text?.trim() ||
-    "";
+  // En espacios: argumentText trae el texto SIN la mención
+  const text =
+    (msg.argumentText ?? msg.formattedText ?? msg.text ?? "").trim();
 
-  const threadName = msg?.thread?.name; // responder en el mismo hilo si existe
+  // Respuesta síncrona mínima (lo que espera Google Chat)
+  const reply = { text: `recibido. tu mensaje fue: "${text}"` };
 
-  // Armar respuesta simple
-  const replyText = `recibido. tu mensaje fue: "${textRaw}"`;
-
-  const reply = {
-    text: replyText,
-    messageReplyOption: "REPLY_MESSAGE_FALLBACK",
-  };
-
-  if (threadName) {
-    reply.thread = { name: threadName };
-  }
-
-  // Enviar respuesta síncrona (lo que espera Chat)
+  // Importante: responder rápido, con 200 y application/json
   return res
     .status(200)
-    .set("Content-Type", "application/json; charset=utf-8")
-    .send(reply);
+    .type("application/json; charset=UTF-8")
+    .send(JSON.stringify(reply));
 });
 
-// Arrancar servidor
+// Iniciar servidor
 app.listen(PORT, () => {
   console.log(`🚀 Escuchando en http://localhost:${PORT}`);
 });
