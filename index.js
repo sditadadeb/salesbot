@@ -1,5 +1,6 @@
 // index.js
 const express = require("express");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,20 +9,34 @@ const PORT = process.env.PORT || 3000;
 // LANGFLOW_HOST       -> p.ej. https://journey-builder.qa.numia.co
 // LANGFLOW_FLOW_ID    -> p.ej. 42037c19-636c-42f0-b8ed-7d9ef7c39459
 // LANGFLOW_API_KEY    -> tu API key de Langflow
-// (opcional) LANGFLOW_TIMEOUT_MS -> default 4500
-
-if (!process.env.LANGFLOW_HOST) console.warn("⚠️ Falta LANGFLOW_HOST");
-if (!process.env.LANGFLOW_FLOW_ID) console.warn("⚠️ Falta LANGFLOW_FLOW_ID");
-if (!process.env.LANGFLOW_API_KEY) console.warn("⚠️ Falta LANGFLOW_API_KEY");
+// (opcional) LANGFLOW_TIMEOUT_MS -> default 4500 (ms)
+// (opcional) LOG_LEVEL -> debug | info | warn | error (default: debug)
 
 const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 4500);
+const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
 
-app.use(express.json());
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+function log(level, msg, meta = {}) {
+  if ((LEVELS[level] || 99) < (LEVELS[LOG_LEVEL] || 99)) return;
+  const line = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    ...meta,
+  };
+  try {
+    console.log(JSON.stringify(line));
+  } catch {
+    console.log(`[${line.ts}] ${level.toUpperCase()} ${msg}`);
+  }
+}
 
-// Healthcheck
-app.get("/", (_req, res) => res.status(200).send("OK"));
+function truncate(s, n = 500) {
+  if (!s) return "";
+  const str = String(s);
+  return str.length > n ? str.slice(0, n) + "…(trunc)" : str;
+}
 
-/** Build URL de /run/<FLOW_ID> a partir de HOST + FLOW_ID */
 function buildLangflowRunUrl() {
   const host = String(process.env.LANGFLOW_HOST || "").replace(/\/+$/, "");
   const flowId = process.env.LANGFLOW_FLOW_ID || "";
@@ -29,19 +44,16 @@ function buildLangflowRunUrl() {
   return `${host}/api/v1/run/${flowId}`;
 }
 
-/** fetch con timeout */
 async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(url, { ...options, signal: controller.signal });
-    return resp;
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(id);
   }
 }
 
-/** Mejor esfuerzo para extraer texto útil del JSON de Langflow */
 function pickTextFromLangflow(json) {
   if (typeof json === "string") return json;
   if (typeof json?.text === "string") return json.text;
@@ -66,7 +78,7 @@ function pickTextFromLangflow(json) {
     }
   } catch {}
 
-  // Búsqueda profunda de "text"
+  // Búsqueda profunda
   try {
     const stack = [json];
     const seen = new Set();
@@ -79,11 +91,10 @@ function pickTextFromLangflow(json) {
     }
   } catch {}
 
-  return JSON.stringify(json).slice(0, 1000);
+  return ""; // importante para fallback
 }
 
-/** Llama a Langflow y devuelve texto del agente */
-async function callLangflow(userText, sessionId = "default_session") {
+async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
 
@@ -91,44 +102,103 @@ async function callLangflow(userText, sessionId = "default_session") {
     input_value: userText ?? "",
     output_type: "chat",
     input_type: "chat",
-    session_id: sessionId,
+    session_id: sessionId || "default_session",
   };
 
-  const options = {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.LANGFLOW_API_KEY || "",
-    },
-    body: JSON.stringify(payload),
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": process.env.LANGFLOW_API_KEY || "",
   };
 
-  const resp = await fetchWithTimeout(url, options, LANGFLOW_TIMEOUT_MS);
-  const json = await resp.json().catch(() => ({}));
-  return pickTextFromLangflow(json);
-}
+  log("debug", "langflow.request", {
+    reqId,
+    url,
+    timeoutMs: LANGFLOW_TIMEOUT_MS,
+    sessionId,
+    body: truncate(JSON.stringify(payload), 300),
+    hasApiKey: !!process.env.LANGFLOW_API_KEY,
+  });
 
-/** Escapa HTML para cards si hiciera falta en el futuro */
-function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+  const resp = await fetchWithTimeout(url, { method: "POST", headers, body: JSON.stringify(payload) }, LANGFLOW_TIMEOUT_MS);
+  const raw = await resp.text();
 
-// === Endpoint principal para Google Chat (Add-on HTTP) ===
-// Debe estar configurado como HTTP endpoint en TODOS los activadores.
-app.post("/events", async (req, res) => {
-  const body = req.body || {};
+  log("debug", "langflow.response", {
+    reqId,
+    status: resp.status,
+    ok: resp.ok,
+    raw: truncate(raw, 500),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+  }
+
+  // Intentar parsear
+  let json;
   try {
-    console.log("📨 POST /events");
-    console.log("📥 Body:", JSON.stringify(body));
-  } catch {}
+    json = JSON.parse(raw);
+  } catch {
+    // si no es JSON, devolver texto plano
+    return (raw || "").trim();
+  }
+
+  const out = (pickTextFromLangflow(json) || "").trim();
+
+  log("debug", "langflow.extracted", { reqId, outPreview: truncate(out, 300) });
+  return out;
+}
+
+// ---------- Middleware de logging por request ----------
+app.use(express.json({ limit: "2mb" }));
+app.use((req, _res, next) => {
+  // usar x-request-id si viene de Render, si no generamos uno
+  const reqId = req.headers["x-request-id"] || crypto.randomUUID();
+  req.reqId = reqId;
+  log("info", "http.request", {
+    reqId,
+    method: req.method,
+    path: req.path,
+    ip: req.ip,
+    ua: req.headers["user-agent"],
+    contentType: req.headers["content-type"],
+  });
+  next();
+});
+
+// Health
+app.get("/", (req, res) => {
+  log("debug", "healthcheck", { reqId: req.reqId });
+  res.status(200).send("OK");
+});
+
+// ---------- Webhook principal para Google Chat (Add-on HTTP) ----------
+app.post("/events", async (req, res) => {
+  const reqId = req.reqId;
+  const body = req.body || {};
+  log("debug", "chat.event.received", {
+    reqId,
+    bodyPreview: truncate(JSON.stringify(body), 1000),
+  });
 
   const mp = body?.chat?.messagePayload;
   const msg = mp?.message;
   const threadName = msg?.thread?.name;
   const spaceName = mp?.space?.name;
-  const userText = (msg?.argumentText ?? msg?.formattedText ?? msg?.text ?? "").trim();
+  const isDM = mp?.space?.type === "DM";
+  const userEmail = body?.chat?.user?.email;
 
-  // Si no hay mensaje (p.ej. ADDED_TO_SPACE), saludo simple
+  const textRaw = (msg?.argumentText ?? msg?.formattedText ?? msg?.text ?? "").trim();
+
+  log("info", "chat.event.parsed", {
+    reqId,
+    userEmail,
+    spaceName,
+    isDM,
+    threadName,
+    textRaw,
+  });
+
+  // Si no hay mensaje (ej: ADDED_TO_SPACE), saludo simple
   if (!msg) {
     const welcome = {
       hostAppDataAction: {
@@ -139,23 +209,26 @@ app.post("/events", async (req, res) => {
         },
       },
     };
+    log("debug", "chat.reply.welcome", { reqId, welcome });
     return res.status(200).type("application/json; charset=UTF-8").send(JSON.stringify(welcome));
   }
 
-  // Elegimos una session_id estable para Langflow (hilo > espacio > email > default)
-  const sessionId = threadName || spaceName || body?.chat?.user?.email || "default_session";
+  // session_id estable para Langflow
+  const sessionId = threadName || spaceName || userEmail || "default_session";
 
   let agentText = "";
   try {
-    agentText = await callLangflow(userText, sessionId);
+    agentText = await callLangflow(textRaw, sessionId, reqId);
   } catch (e) {
-    console.error("❌ Error Langflow:", e.message);
-    agentText = `No pude hablar con el agente ahora. Eco: "${userText}"`;
+    log("error", "langflow.error", { reqId, error: e.message });
   }
 
-  // En Add-on HTTP, la respuesta síncrona DEBE venir envuelta:
-  // hostAppDataAction -> chatDataAction -> createMessageAction -> message
-  const message = { text: agentText || "(sin respuesta del agente)" };
+  if (!agentText) {
+    agentText = `recibido. tu mensaje fue: "${textRaw}"`;
+    log("warn", "langflow.empty_output_fallback", { reqId });
+  }
+
+  const message = { text: agentText };
   if (threadName) message.thread = { name: threadName };
 
   const reply = {
@@ -166,10 +239,19 @@ app.post("/events", async (req, res) => {
     },
   };
 
-  console.log("📤 Reply:", JSON.stringify(reply));
+  log("info", "chat.reply.sending", { reqId, replyPreview: truncate(JSON.stringify(reply), 800) });
+
   return res.status(200).type("application/json; charset=UTF-8").send(JSON.stringify(reply));
 });
 
+// ---------- Arranque ----------
 app.listen(PORT, () => {
-  console.log(`🚀 Escuchando en http://localhost:${PORT}`);
+  log("info", "server.started", {
+    port: PORT,
+    langflowHost: process.env.LANGFLOW_HOST || null,
+    flowId: process.env.LANGFLOW_FLOW_ID || null,
+    hasApiKey: !!process.env.LANGFLOW_API_KEY,
+    timeoutMs: LANGFLOW_TIMEOUT_MS,
+    logLevel: LOG_LEVEL,
+  });
 });
