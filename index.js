@@ -1,49 +1,42 @@
 // index.js
+// Bot de Google Chat (HTTP Add-on) + Langflow
+// Env vars necesarias:
+//  - LANGFLOW_HOST        (p.ej. https://<backend-api>.tu-dominio.com)
+//  - LANGFLOW_FLOW_ID     (UUID del flow)
+//  - LANGFLOW_API_KEY     (API key de Langflow)
+//  - PORT                 (opcional; Render la setea)
+//  - LANGFLOW_TIMEOUT_MS  (opcional; default 4500)
+//  - LOG_LEVEL            (opcional: debug|info|warn|error; default debug)
+
 const express = require("express");
 const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// === ENV requeridas ===
-// LANGFLOW_HOST       -> p.ej. https://journey-builder.qa.numia.co
-// LANGFLOW_FLOW_ID    -> p.ej. 42037c19-636c-42f0-b8ed-7d9ef7c39459
-// LANGFLOW_API_KEY    -> tu API key de Langflow
-// (opcional) LANGFLOW_TIMEOUT_MS -> default 4500 (ms)
-// (opcional) LOG_LEVEL -> debug | info | warn | error (default: debug)
-
-const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 4500);
 const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 4500);
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 function log(level, msg, meta = {}) {
   if ((LEVELS[level] || 99) < (LEVELS[LOG_LEVEL] || 99)) return;
-  const line = {
-    ts: new Date().toISOString(),
-    level,
-    msg,
-    ...meta,
-  };
-  try {
-    console.log(JSON.stringify(line));
-  } catch {
-    console.log(`[${line.ts}] ${level.toUpperCase()} ${msg}`);
-  }
+  const line = { ts: new Date().toISOString(), level, msg, ...meta };
+  try { console.log(JSON.stringify(line)); }
+  catch { console.log(`[${line.ts}] ${level.toUpperCase()} ${msg}`); }
 }
-
 function truncate(s, n = 500) {
   if (!s) return "";
   const str = String(s);
   return str.length > n ? str.slice(0, n) + "…(trunc)" : str;
 }
 
+// ---------------------- Langflow helpers ----------------------
 function buildLangflowRunUrl() {
   const host = String(process.env.LANGFLOW_HOST || "").replace(/\/+$/, "");
   const flowId = process.env.LANGFLOW_FLOW_ID || "";
   if (!host || !flowId) return "";
   return `${host}/api/v1/run/${flowId}`;
 }
-
 async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -53,7 +46,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
     clearTimeout(id);
   }
 }
-
 function pickTextFromLangflow(json) {
   if (typeof json === "string") return json;
   if (typeof json?.text === "string") return json.text;
@@ -78,7 +70,6 @@ function pickTextFromLangflow(json) {
     }
   } catch {}
 
-  // Búsqueda profunda
   try {
     const stack = [json];
     const seen = new Set();
@@ -90,10 +81,10 @@ function pickTextFromLangflow(json) {
       for (const k of Object.keys(cur)) stack.push(cur[k]);
     }
   } catch {}
-
-  return ""; // importante para fallback
+  return "";
 }
 
+// Llamada a Langflow con protección contra HTML / no-JSON
 async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
@@ -107,59 +98,60 @@ async function callLangflow(userText, sessionId, reqId) {
 
   const headers = {
     "Content-Type": "application/json",
+    "Accept": "application/json",
     "x-api-key": process.env.LANGFLOW_API_KEY || "",
   };
 
   log("debug", "langflow.request", {
-    reqId,
-    url,
-    timeoutMs: LANGFLOW_TIMEOUT_MS,
-    sessionId,
-    body: truncate(JSON.stringify(payload), 300),
+    reqId, url, timeoutMs: LANGFLOW_TIMEOUT_MS,
+    sessionId, body: truncate(JSON.stringify(payload), 300),
     hasApiKey: !!process.env.LANGFLOW_API_KEY,
   });
 
-  const resp = await fetchWithTimeout(url, { method: "POST", headers, body: JSON.stringify(payload) }, LANGFLOW_TIMEOUT_MS);
+  const resp = await fetchWithTimeout(
+    url,
+    { method: "POST", headers, body: JSON.stringify(payload) },
+    LANGFLOW_TIMEOUT_MS
+  );
+
+  const contentType = resp.headers.get("content-type") || "";
   const raw = await resp.text();
 
   log("debug", "langflow.response", {
-    reqId,
-    status: resp.status,
-    ok: resp.ok,
-    raw: truncate(raw, 500),
+    reqId, status: resp.status, ok: resp.ok,
+    contentType, raw: truncate(raw, 500),
   });
 
-  if (!resp.ok) {
-    throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+  if (!resp.ok) throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+
+  // Si no parece JSON (o parece HTML), forzamos fallback devolviendo vacío
+  const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
+  const looksJson = contentType.includes("application/json");
+  if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
+    log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
+    return "";
   }
 
-  // Intentar parsear
   let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    // si no es JSON, devolver texto plano
-    return (raw || "").trim();
+  try { json = JSON.parse(raw); }
+  catch {
+    log("warn", "langflow.parse_failed", { reqId, rawPreview: truncate(raw, 200) });
+    return "";
   }
 
   const out = (pickTextFromLangflow(json) || "").trim();
-
   log("debug", "langflow.extracted", { reqId, outPreview: truncate(out, 300) });
   return out;
 }
 
-// ---------- Middleware de logging por request ----------
+// ---------------------- Middleware ----------------------
 app.use(express.json({ limit: "2mb" }));
 app.use((req, _res, next) => {
-  // usar x-request-id si viene de Render, si no generamos uno
   const reqId = req.headers["x-request-id"] || crypto.randomUUID();
   req.reqId = reqId;
   log("info", "http.request", {
-    reqId,
-    method: req.method,
-    path: req.path,
-    ip: req.ip,
-    ua: req.headers["user-agent"],
+    reqId, method: req.method, path: req.path,
+    ip: req.ip, ua: req.headers["user-agent"],
     contentType: req.headers["content-type"],
   });
   next();
@@ -171,14 +163,11 @@ app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// ---------- Webhook principal para Google Chat (Add-on HTTP) ----------
+// ---------------------- Webhook Google Chat ----------------------
 app.post("/events", async (req, res) => {
   const reqId = req.reqId;
   const body = req.body || {};
-  log("debug", "chat.event.received", {
-    reqId,
-    bodyPreview: truncate(JSON.stringify(body), 1000),
-  });
+  log("debug", "chat.event.received", { reqId, bodyPreview: truncate(JSON.stringify(body), 1000) });
 
   const mp = body?.chat?.messagePayload;
   const msg = mp?.message;
@@ -186,19 +175,13 @@ app.post("/events", async (req, res) => {
   const spaceName = mp?.space?.name;
   const isDM = mp?.space?.type === "DM";
   const userEmail = body?.chat?.user?.email;
-
   const textRaw = (msg?.argumentText ?? msg?.formattedText ?? msg?.text ?? "").trim();
 
   log("info", "chat.event.parsed", {
-    reqId,
-    userEmail,
-    spaceName,
-    isDM,
-    threadName,
-    textRaw,
+    reqId, userEmail, spaceName, isDM, threadName, textRaw,
   });
 
-  // Si no hay mensaje (ej: ADDED_TO_SPACE), saludo simple
+  // Si no hay mensaje (alta al espacio, etc.), saludo simple
   if (!msg) {
     const welcome = {
       hostAppDataAction: {
@@ -210,10 +193,12 @@ app.post("/events", async (req, res) => {
       },
     };
     log("debug", "chat.reply.welcome", { reqId, welcome });
-    return res.status(200).type("application/json; charset=UTF-8").send(JSON.stringify(welcome));
+    return res
+      .status(200)
+      .type("application/json; charset=UTF-8")
+      .send(JSON.stringify(welcome));
   }
 
-  // session_id estable para Langflow
   const sessionId = threadName || spaceName || userEmail || "default_session";
 
   let agentText = "";
@@ -241,10 +226,13 @@ app.post("/events", async (req, res) => {
 
   log("info", "chat.reply.sending", { reqId, replyPreview: truncate(JSON.stringify(reply), 800) });
 
-  return res.status(200).type("application/json; charset=UTF-8").send(JSON.stringify(reply));
+  return res
+    .status(200)
+    .type("application/json; charset=UTF-8")
+    .send(JSON.stringify(reply));
 });
 
-// ---------- Arranque ----------
+// ---------------------- Start ----------------------
 app.listen(PORT, () => {
   log("info", "server.started", {
     port: PORT,
