@@ -1,170 +1,89 @@
 // index.js
-// Bot de Google Chat ↔ Langflow (Render)
-// --------------------------------------
-// Requisitos de entorno (ENV):
-// - LANGFLOW_API_HOST   (p.ej. https://api.journey-builder.qa.numia.co)
-// - LANGFLOW_FLOW_ID    (ID del flow en Langflow, sin /api/v1/run/)
-// - LANGFLOW_API_KEY    (API key de Langflow)
-// - SESSION_STRATEGY    (opcional: thread | space | space_user | user)  [default: thread]
-// - PORT                (opcional, Render lo provee como 10000)
+// Bot Google Chat ↔ Langflow (Render)
+// ENV aceptadas:
+// - LANGFLOW_API_HOST  (o LANGFLOW_HOST)  ← se aceptan ambas
+// - LANGFLOW_FLOW_ID
+// - LANGFLOW_API_KEY
+// - SESSION_STRATEGY   (opcional: thread | space | space_user | user) [default: thread]
+// - LANGFLOW_TIMEOUT_MS (opcional, default 15000)
+// - LANGFLOW_RETRIES    (opcional, default 2)
+// - PORT (Render la setea)
 
 "use strict";
 
 const express = require("express");
+const { randomUUID } = require("crypto");
 
-// ---- Utilidades de log en JSON (legibles en Render) ----
-function log(level, msg, extra = {}) {
-  try {
-    console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...extra }));
-  } catch {
-    console.log(`[${level}] ${msg}`);
-  }
+// ----------------- Utils de log -----------------
+function log(level, msg, meta = {}) {
+  try { console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta })); }
+  catch { console.log(`[${level}] ${msg}`); }
 }
+function preview(obj, n = 1000) {
+  try {
+    const s = typeof obj === "string" ? obj : JSON.stringify(obj);
+    return s.length > n ? s.slice(0, n) + "…(trunc)" : s;
+  } catch { return "<unserializable>"; }
+}
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function stripTrailingSlash(u){ return (u || "").replace(/\/+$/, ""); }
 
-// ---- Validación de ENV ----
-const {
-  LANGFLOW_API_HOST,
-  LANGFLOW_FLOW_ID,
-  LANGFLOW_API_KEY,
-  SESSION_STRATEGY = "thread",
-} = process.env;
+// ----------------- ENV y defaults -----------------
+const LANGFLOW_HOST_ENV = process.env.LANGFLOW_API_HOST || process.env.LANGFLOW_HOST || "";
+const LANGFLOW_FLOW_ID  = process.env.LANGFLOW_FLOW_ID || "";
+const LANGFLOW_API_KEY  = process.env.LANGFLOW_API_KEY || "";
+const SESSION_STRATEGY  = (process.env.SESSION_STRATEGY || "thread").toLowerCase();
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 15000);
+const LANGFLOW_RETRIES    = Number(process.env.LANGFLOW_RETRIES || 2);
+const PORT = process.env.PORT || 3000;
 
-if (!LANGFLOW_API_HOST || !LANGFLOW_FLOW_ID || !LANGFLOW_API_KEY) {
+if (!LANGFLOW_HOST_ENV || !LANGFLOW_FLOW_ID || !LANGFLOW_API_KEY) {
   log("error", "Faltan variables de entorno requeridas", {
-    need: ["LANGFLOW_API_HOST", "LANGFLOW_FLOW_ID", "LANGFLOW_API_KEY"],
-    have: { LANGFLOW_API_HOST: !!LANGFLOW_API_HOST, LANGFLOW_FLOW_ID: !!LANGFLOW_FLOW_ID, LANGFLOW_API_KEY: !!LANGFLOW_API_KEY },
+    need: ["LANGFLOW_API_HOST (o LANGFLOW_HOST)", "LANGFLOW_FLOW_ID", "LANGFLOW_API_KEY"],
+    have: {
+      LANGFLOW_API_HOST_or_LANGFLOW_HOST: !!LANGFLOW_HOST_ENV,
+      LANGFLOW_FLOW_ID: !!LANGFLOW_FLOW_ID,
+      LANGFLOW_API_KEY: !!LANGFLOW_API_KEY,
+    },
   });
   process.exit(1);
 }
 
-const LANGFLOW_URL = `${stripTrailingSlash(LANGFLOW_API_HOST)}/api/v1/run/${LANGFLOW_FLOW_ID}`;
+const LANGFLOW_URL = `${stripTrailingSlash(LANGFLOW_HOST_ENV)}/api/v1/run/${LANGFLOW_FLOW_ID}`;
 
-// ---- App HTTP ----
+// ----------------- App -----------------
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Healthcheck
-app.get("/", (_req, res) => {
-  res.status(200).send("OK");
-});
+// Health
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
-// Punto de entrada del Webhook de Google Chat
-app.post("/events", async (req, res) => {
-  const reqId = cryptoId();
-  log("info", "http.request", {
-    reqId,
-    method: "POST",
-    path: "/events",
-    ip: req.ip || req.headers["x-forwarded-for"] || "unknown",
-    ua: req.headers["user-agent"],
-    contentType: req.headers["content-type"],
-  });
-
-  const body = req.body || {};
-  log("debug", "chat.event.received", {
-    reqId,
-    bodyPreview: safePreviewJSON(body),
-  });
-
-  // Parseo de evento (DM/SPACE, texto, hilo, etc.)
-  const parsed = parseChatEvent(body);
-  log("info", "chat.event.parsed", { reqId, ...parsed });
-
-  // Si no hay texto, ignoramos con 200 (para que Chat no reintente)
-  if (!parsed.textRaw) {
-    log("warn", "chat.event.no_text", { reqId });
-    return res.status(200).send({});
-  }
-
-  // Construir session_id según estrategia
-  const sessionId = computeSessionId({
-    strategy: SESSION_STRATEGY,
-    threadName: parsed.threadName,
-    spaceName: parsed.spaceName,
-    userEmail: parsed.userEmail,
-  });
-
-  // Enviar a Langflow
-  let replyText = "";
+// Egress IP (para allowlist)
+app.get("/egress", async (_req, res) => {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4500);
-
-    const lfBody = {
-      input_value: parsed.textRaw,
-      output_type: "chat",
-      input_type: "chat",
-      session_id: sessionId,
-    };
-
-    log("debug", "langflow.request", {
-      reqId,
-      url: LANGFLOW_URL,
-      timeoutMs: 4500,
-      sessionId,
-      body: JSON.stringify(lfBody),
-      hasApiKey: !!LANGFLOW_API_KEY,
-    });
-
-    const r = await fetch(LANGFLOW_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": LANGFLOW_API_KEY,
-      },
-      body: JSON.stringify(lfBody),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    const contentType = r.headers.get("content-type") || "";
-    const raw = contentType.includes("application/json") ? await r.json().catch(() => ({})) : await r.text();
-
-    log("debug", "langflow.response", {
-      reqId,
-      status: r.status,
-      ok: r.ok,
-      contentType,
-      raw: contentType.includes("json") ? safePreviewJSON(raw) : safePreviewText(raw),
-    });
-
-    if (!r.ok) {
-      // Errores típicos (IP allowlist, etc.)
-      if (r.status === 403) {
-        const msg = "No tengo permiso para hablar con el agente (IP bloqueada). Avisá para allowlistear mi IP de salida.";
-        log("error", "langflow.error", { reqId, error: `Langflow HTTP 403: ${JSON.stringify(raw)}` });
-        replyText = msg;
-      } else {
-        log("error", "langflow.error", { reqId, error: `Langflow HTTP ${r.status}` });
-        replyText = `Ups, hubo un error (${r.status}).`;
-      }
-    } else {
-      // Extraer texto de la respuesta de Langflow
-      replyText = extractTextFromLangflow(raw);
-      if (!replyText) {
-        replyText = `recibido. tu mensaje fue: "${parsed.textRaw}"`; // Fallback amable
-        log("warn", "langflow.empty_output_fallback", { reqId });
-      }
-    }
-  } catch (err) {
-    const errMsg = String(err && err.message ? err.message : err);
-    log("error", "langflow.error", { reqId, error: errMsg });
-    replyText = "Se agotó el tiempo o falló la conexión con el agente.";
+    const r = await fetch("https://api.ipify.org?format=json");
+    const j = await r.json();
+    log("info", "egress.ip", { ip: j.ip });
+    res.json(j);
+  } catch (e) {
+    log("warn", "egress.ip.failed", { error: String(e.message || e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
-
-  // Armar respuesta para Google Chat
-  const response = buildChatReply(replyText, parsed.threadName);
-  log("info", "chat.reply.sending", { reqId, replyPreview: safePreviewJSON(response) });
-
-  // Enviar 200 inmediatamente con el payload
-  res.status(200).json(response);
 });
 
-// ---- Helpers ----
+// (Opcional) ver config (sin exponer API key)
+app.get("/config", (_req, res) => {
+  res.json({
+    langflowUrl: LANGFLOW_URL,
+    sessionStrategy: SESSION_STRATEGY,
+    timeoutMs: LANGFLOW_TIMEOUT_MS,
+    retries: LANGFLOW_RETRIES,
+    hasApiKey: !!LANGFLOW_API_KEY,
+  });
+});
 
+// ----------------- Helpers Google Chat -----------------
 function parseChatEvent(body) {
-  // El payload puede venir bajo body.chat.messagePayload.message o body.message, según la versión.
   const mp = body?.chat?.messagePayload || {};
   const space = mp.space || body?.space || {};
   const message = mp.message || body?.message || {};
@@ -177,17 +96,11 @@ function parseChatEvent(body) {
     space.spaceType === "DIRECT_MESSAGE" ||
     space.spaceThreadingState === "UNTHREADED_MESSAGES";
 
-  const threadName =
-    message?.thread?.name ||
-    mp?.message?.thread?.name ||
-    undefined;
+  const threadName = message?.thread?.name || undefined;
 
-  // Texto: preferimos argumentText (sin menciones); sino text.
   let textRaw = message.argumentText || message.text || "";
   textRaw = (textRaw || "").trim();
-
-  // Si aún viene con mención manual, limpiamos "@bot algo"
-  textRaw = textRaw.replace(/^@\S+\s*/, "");
+  textRaw = textRaw.replace(/^@\S+\s*/, ""); // limpia "@bot ..."
 
   return {
     userEmail: user.email,
@@ -198,8 +111,10 @@ function parseChatEvent(body) {
   };
 }
 
-function computeSessionId({ strategy, threadName, spaceName, userEmail }) {
-  switch ((strategy || "").toLowerCase()) {
+function computeSessionId({ strategy, isDM, threadName, spaceName, userEmail }) {
+  // Forzamos sesiones estables en DM:
+  const effStrategy = isDM ? "space_user" : (strategy || "thread");
+  switch (effStrategy) {
     case "space":
       return spaceName || threadName || userEmail || "default_session";
     case "space_user":
@@ -213,120 +128,207 @@ function computeSessionId({ strategy, threadName, spaceName, userEmail }) {
 }
 
 function buildChatReply(text, threadName) {
-  // Respuesta simple compatible con Google Chat (sin HTML)
-  const message = { text: text || "", };
+  const message = { text: text || "" };
   if (threadName) message.thread = { name: threadName };
-
-  // Usamos hostAppDataAction (soporta respuestas ricas), con fallback a text plano.
   return {
     hostAppDataAction: {
       chatDataAction: {
         createMessageAction: { message },
       },
     },
-    // Fallback para clientes que no soporten hostAppDataAction
-    text: message.text,
-    thread: message.thread,
+    text: message.text,      // fallback
+    thread: message.thread,  // fallback
   };
 }
 
-// Intenta extraer texto de estructuras variadas de Langflow
-function extractTextFromLangflow(raw) {
+// ----------------- Langflow -----------------
+function looksHtml(s) {
+  return /^\s*</.test(s || "");
+}
+
+async function callLangflow({ text, sessionId, reqId }) {
+  const payload = {
+    input_value: text ?? "",
+    output_type: "chat",
+    input_type: "chat",
+    session_id: sessionId || "default_session",
+  };
+
+  let lastErr;
+  const attempts = LANGFLOW_RETRIES + 1;
+
+  for (let i = 1; i <= attempts; i++) {
+    log("debug", "langflow.request", {
+      reqId, attempt: `${i}/${attempts}`,
+      url: LANGFLOW_URL, timeoutMs: LANGFLOW_TIMEOUT_MS,
+      sessionId, body: preview(payload, 300), hasApiKey: !!LANGFLOW_API_KEY,
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LANGFLOW_TIMEOUT_MS);
+
+    try {
+      const r = await fetch(LANGFLOW_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": LANGFLOW_API_KEY },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      const contentType = r.headers.get("content-type") || "";
+      const raw = await r.text();
+
+      log("debug", "langflow.response", {
+        reqId, attempt: `${i}/${attempts}`, status: r.status, ok: r.ok,
+        contentType, raw: preview(raw, 500),
+      });
+
+      if (!r.ok) {
+        if (r.status === 403) {
+          throw new Error(`403_FORBIDDEN ${raw}`);
+        }
+        if (r.status >= 500 || r.status === 429) {
+          lastErr = new Error(`Langflow HTTP ${r.status}: ${raw}`);
+          // retry con backoff
+        } else {
+          throw new Error(`Langflow HTTP ${r.status}: ${raw}`);
+        }
+      } else {
+        if (looksHtml(raw) || (!contentType.includes("json") && !raw.trim().startsWith("{"))) {
+          log("warn", "langflow.non_json_response", { reqId, contentType });
+          return ""; // forzamos fallback amable
+        }
+        let json;
+        try { json = JSON.parse(raw); }
+        catch { return ""; }
+        const textOut = extractText(json);
+        return (textOut || "").trim();
+      }
+    } catch (e) {
+      clearTimeout(timer);
+      const msg = String(e?.message || e);
+      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, error: msg });
+
+      const abortLike = /aborted|timeout/i.test(msg);
+      const retriable = abortLike || /Langflow HTTP (5\d\d|429)/i.test(msg);
+      if (retriable && i < attempts) {
+        const delay = Math.min(1000 * i * i, 4000); // 1s, 4s, 9s... cap 4s
+        log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
+        await sleep(delay);
+        continue;
+      }
+      lastErr = e;
+      break;
+    }
+  }
+  throw lastErr || new Error("Langflow no respondió");
+}
+
+// Extrae texto desde distintas formas de respuesta de Langflow
+function extractText(raw) {
   if (raw == null) return "";
+  if (typeof raw === "string") return raw;
 
-  if (typeof raw === "string") {
-    // Si Langflow devolvió HTML (ej. index app), no lo mostramos
-    if (raw.trim().startsWith("<!doctype") || raw.trim().startsWith("<html")) return "";
-    return raw;
+  // 1) Claves frecuentes
+  for (const k of ["text", "message", "output", "content", "result"]) {
+    if (typeof raw[k] === "string" && raw[k].trim()) return raw[k];
   }
 
-  // Caso esperado de Langflow (distintas formas)
-  // Buscamos cualquier 'text' profundo
-  const deep = findFirstStringByKeys(raw, ["text", "content", "message", "output", "result"]);
-  if (deep) return deep;
-
-  // Algunos flows devuelven { outputs: [ { outputs: [ { results: { message: [ { data: { text } } ]}}]}]}
+  // 2) outputs[] anidados
   try {
-    const outputs = raw.outputs || raw.data || [];
-    const first = Array.isArray(outputs) ? outputs[0] : outputs;
-    const nested = first?.outputs || first?.results || first;
-    const asArr = Array.isArray(nested) ? nested : [nested];
-
-    for (const item of asArr) {
-      // message array
-      const msgArr = item?.results?.message || item?.message || [];
-      if (Array.isArray(msgArr)) {
-        for (const m of msgArr) {
-          const t = m?.data?.text || m?.text;
-          if (typeof t === "string" && t.trim()) return t;
+    const outs = raw.outputs;
+    if (Array.isArray(outs)) {
+      for (const o1 of outs) {
+        const o2s = o1?.outputs;
+        if (Array.isArray(o2s)) {
+          for (const o2 of o2s) {
+            if (typeof o2?.text === "string") return o2.text;
+            if (typeof o2?.message === "string") return o2.message;
+            if (typeof o2?.output_text === "string") return o2.output_text;
+            if (o2?.data?.text) return String(o2.data.text);
+            if (o2?.artifacts?.text) return String(o2.artifacts.text);
+          }
         }
       }
-      // direct text
-      const t = item?.results?.text || item?.text;
-      if (typeof t === "string" && t.trim()) return t;
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
 
-  // Nada encontrado
+  // 3) Búsqueda profunda
+  try {
+    const stack = [raw];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+      seen.add(cur);
+      if (typeof cur.text === "string" && cur.text.trim()) return cur.text;
+      for (const k of Object.keys(cur)) stack.push(cur[k]);
+    }
+  } catch {}
   return "";
 }
 
-function findFirstStringByKeys(obj, keys) {
-  try {
-    if (typeof obj === "string") return obj;
-    if (Array.isArray(obj)) {
-      for (const it of obj) {
-        const v = findFirstStringByKeys(it, keys);
-        if (v) return v;
-      }
-      return "";
-    }
-    if (obj && typeof obj === "object") {
-      for (const k of Object.keys(obj)) {
-        if (keys.includes(k) && typeof obj[k] === "string" && obj[k].trim()) {
-          return obj[k];
-        }
-        const v = findFirstStringByKeys(obj[k], keys);
-        if (v) return v;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return "";
-}
+// ----------------- Webhook -----------------
+app.post("/events", async (req, res) => {
+  const reqId = randomUUID();
+  log("info", "http.request", {
+    reqId, method: "POST", path: "/events",
+    ip: req.ip || req.headers["x-forwarded-for"] || "unknown",
+    ua: req.headers["user-agent"],
+    contentType: req.headers["content-type"],
+  });
 
-function safePreviewJSON(v) {
-  try {
-    const s = JSON.stringify(v);
-    return s.length > 1000 ? s.slice(0, 1000) + "…(trunc)" : s;
-  } catch {
-    return "<unserializable>";
-  }
-}
-function safePreviewText(v) {
-  try {
-    const s = String(v);
-    return s.length > 1000 ? s.slice(0, 1000) + "…(trunc)" : s;
-  } catch {
-    return "<unserializable>";
-  }
-}
-function stripTrailingSlash(u) {
-  return (u || "").replace(/\/+$/, "");
-}
-function cryptoId() {
-  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^cryptoRandom()*16>>c/4).toString(16));
-}
-// pseudo-random simple (no crypto)
-function cryptoRandom() {
-  return Math.random();
-}
+  const body = req.body || {};
+  log("debug", "chat.event.received", { reqId, bodyPreview: preview(body) });
 
-// ---- Inicio del servidor ----
-const PORT = process.env.PORT || 3000;
+  const parsed = parseChatEvent(body);
+  log("info", "chat.event.parsed", { reqId, ...parsed });
+
+  if (!parsed.textRaw) {
+    // evento sin texto (alta al espacio, etc.)
+    const welcome = buildChatReply("¡Gracias por invitarme! Decime algo y lo paso por el agente.", parsed.threadName);
+    log("debug", "chat.reply.welcome", { reqId, replyPreview: preview(welcome) });
+    return res.status(200).json(welcome);
+  }
+
+  const sessionId = computeSessionId({
+    strategy: SESSION_STRATEGY,
+    isDM: parsed.isDM,
+    threadName: parsed.threadName,
+    spaceName: parsed.spaceName,
+    userEmail: parsed.userEmail,
+  });
+
+  let textOut = "";
+  try {
+    textOut = await callLangflow({ text: parsed.textRaw, sessionId, reqId });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    log("error", "langflow.error", { reqId, error: msg });
+    if (/403_FORBIDDEN/i.test(msg) || /Client IP not allowed/i.test(msg)) {
+      textOut = "No tengo permiso para hablar con el agente (IP bloqueada). Pedí que allowlisteen mi IP de salida.";
+    }
+  }
+
+  if (!textOut) {
+    textOut = `recibido. tu mensaje fue: "${parsed.textRaw}"`;
+    log("warn", "langflow.empty_output_fallback", { reqId });
+  }
+
+  const reply = buildChatReply(textOut, parsed.threadName);
+  log("info", "chat.reply.sending", { reqId, replyPreview: preview(reply) });
+  res.status(200).json(reply);
+});
+
+// ----------------- Start -----------------
 app.listen(PORT, () => {
-  log("info", `Servidor escuchando en http://localhost:${PORT}`, { port: PORT, sessionStrategy: SESSION_STRATEGY });
+  log("info", "server.started", {
+    port: PORT,
+    langflowUrl: LANGFLOW_URL,
+    sessionStrategy: SESSION_STRATEGY,
+    timeoutMs: LANGFLOW_TIMEOUT_MS,
+    retries: LANGFLOW_RETRIES,
+    hasApiKey: !!LANGFLOW_API_KEY,
+  });
 });
