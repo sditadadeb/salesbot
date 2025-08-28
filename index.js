@@ -130,21 +130,17 @@ async function callLangflow(userText, sessionId, reqId) {
       });
 
       if (!resp.ok) {
-        // 4xx no suelen mejorar con retry, salvo 429
         if (resp.status >= 500 || resp.status === 429) {
           lastErr = new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
-          // backoff y reintento
         } else {
-          // 403, 400, etc: no reintentar
           throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
         }
       } else {
-        // OK -> validar que sea JSON
         const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
         const looksJson = contentType.includes("application/json");
         if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
           log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
-          return ""; // fallback
+          return "";
         }
         let json;
         try { json = JSON.parse(raw); }
@@ -164,13 +160,13 @@ async function callLangflow(userText, sessionId, reqId) {
 
       if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
         if (i < attempts) {
-          const delay = Math.min(1000 * i * i, 4000); // 1s, 4s, 9s… (cap 4s)
+          const delay = Math.min(1000 * i * i, 4000);
           log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
           await sleep(delay);
           continue;
         }
       }
-      break; // sin condiciones para retry
+      break;
     }
   }
   throw lastErr || new Error("Langflow no respondió");
@@ -195,7 +191,7 @@ app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// Egress IP (para allowlist en Langflow)
+// Egress IP
 app.get("/egress", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json");
@@ -226,7 +222,6 @@ app.post("/events", async (req, res) => {
     reqId, userEmail, spaceName, isDM, threadName, textRaw,
   });
 
-  // Si no hay mensaje (alta al espacio, etc.), saludo simple
   if (!msg) {
     const welcome = {
       hostAppDataAction: {
@@ -244,7 +239,18 @@ app.post("/events", async (req, res) => {
       .send(JSON.stringify(welcome));
   }
 
-  const sessionId = threadName || spaceName || userEmail || "default_session";
+  // Nuevo cálculo de sessionId
+  const msgId = msg?.name || crypto.randomUUID();
+  let sessionId;
+  if (threadName) {
+    sessionId = `thread:${threadName}`;
+  } else if (isDM) {
+    sessionId = `dm:${userEmail}`;
+  } else if (spaceName) {
+    sessionId = `space:${spaceName}`;
+  } else {
+    sessionId = `fallback:${msgId}`;
+  }
 
   let agentText = "";
   try {
