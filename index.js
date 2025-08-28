@@ -1,7 +1,7 @@
 // index.js
 // Bot de Google Chat (HTTP Add-on) + Langflow
 // Env vars necesarias:
-//  - LANGFLOW_HOST        (p.ej. https://<backend-api>.tu-dominio.com)
+//  - LANGFLOW_HOST        (p.ej. https://api.journey-builder.qa.numia.co)
 //  - LANGFLOW_FLOW_ID     (UUID del flow)
 //  - LANGFLOW_API_KEY     (API key de Langflow)
 //  - PORT                 (opcional; Render la setea)
@@ -40,11 +40,8 @@ function buildLangflowRunUrl() {
 async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(id); }
 }
 function pickTextFromLangflow(json) {
   if (typeof json === "string") return json;
@@ -163,6 +160,19 @@ app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
+// Egress IP (para allowlist en Langflow)
+app.get("/egress", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    const j = await r.json();
+    log("info", "egress.ip", { ip: j.ip });
+    res.json(j);
+  } catch (e) {
+    log("warn", "egress.ip.failed", { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------------------- Webhook Google Chat ----------------------
 app.post("/events", async (req, res) => {
   const reqId = req.reqId;
@@ -206,6 +216,9 @@ app.post("/events", async (req, res) => {
     agentText = await callLangflow(textRaw, sessionId, reqId);
   } catch (e) {
     log("error", "langflow.error", { reqId, error: e.message });
+    if (/Client IP not allowed/i.test(String(e.message))) {
+      agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Avisá para allowlistear mi IP de salida.";
+    }
   }
 
   if (!agentText) {
