@@ -239,18 +239,23 @@ app.post("/events", async (req, res) => {
       .send(JSON.stringify(welcome));
   }
 
-  // Nuevo cálculo de sessionId
+  // Nuevo cálculo de sessionId robusto
+let sessionId;
+if (threadName) {
+  // Caso: mensaje dentro de un hilo oficial de Google Chat
+  sessionId = `thread:${threadName}`;
+} else if (isDM) {
+  // Caso: mensaje directo con un usuario
+  sessionId = `dm:${userEmail}`;
+} else if (spaceName) {
+  // Caso: mensaje en un espacio sin hilo → forzar pseudo-thread
+  sessionId = `space:${spaceName}:default-thread`;
+} else {
+  // Último recurso: usar el ID del mensaje
   const msgId = msg?.name || crypto.randomUUID();
-  let sessionId;
-  if (threadName) {
-    sessionId = `thread:${threadName}`;
-  } else if (isDM) {
-    sessionId = `dm:${userEmail}`;
-  } else if (spaceName) {
-    sessionId = `space:${spaceName}`;
-  } else {
-    sessionId = `fallback:${msgId}`;
-  }
+  sessionId = `fallback:${msgId}`;
+}
+
 
   let agentText = "";
   try {
