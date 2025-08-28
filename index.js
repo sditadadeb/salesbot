@@ -1,11 +1,12 @@
 // index.js
-// Bot de Google Chat (HTTP Add-on) + Langflow
-// Env vars necesarias:
+// Bot de Google Chat (HTTP Add-on) + Langflow con reintentos y logs detallados
+// ENV requeridas:
 //  - LANGFLOW_HOST        (p.ej. https://api.journey-builder.qa.numia.co)
 //  - LANGFLOW_FLOW_ID     (UUID del flow)
 //  - LANGFLOW_API_KEY     (API key de Langflow)
 //  - PORT                 (opcional; Render la setea)
-//  - LANGFLOW_TIMEOUT_MS  (opcional; default 4500)
+//  - LANGFLOW_TIMEOUT_MS  (opcional; default 15000)
+//  - LANGFLOW_RETRIES     (opcional; default 2)
 //  - LOG_LEVEL            (opcional: debug|info|warn|error; default debug)
 
 const express = require("express");
@@ -15,7 +16,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
-const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 4500);
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 15000);
+const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES || 2);
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 function log(level, msg, meta = {}) {
@@ -29,6 +31,7 @@ function truncate(s, n = 500) {
   const str = String(s);
   return str.length > n ? str.slice(0, n) + "…(trunc)" : str;
 }
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 // ---------------------- Langflow helpers ----------------------
 function buildLangflowRunUrl() {
@@ -81,7 +84,7 @@ function pickTextFromLangflow(json) {
   return "";
 }
 
-// Llamada a Langflow con protección contra HTML / no-JSON
+// Llamada a Langflow con protección contra HTML / no-JSON y reintentos
 async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
@@ -99,46 +102,78 @@ async function callLangflow(userText, sessionId, reqId) {
     "x-api-key": process.env.LANGFLOW_API_KEY || "",
   };
 
-  log("debug", "langflow.request", {
-    reqId, url, timeoutMs: LANGFLOW_TIMEOUT_MS,
-    sessionId, body: truncate(JSON.stringify(payload), 300),
-    hasApiKey: !!process.env.LANGFLOW_API_KEY,
-  });
+  let lastErr;
+  const attempts = LANGFLOW_RETRIES + 1;
 
-  const resp = await fetchWithTimeout(
-    url,
-    { method: "POST", headers, body: JSON.stringify(payload) },
-    LANGFLOW_TIMEOUT_MS
-  );
+  for (let i = 1; i <= attempts; i++) {
+    log("debug", "langflow.request", {
+      reqId, attempt: `${i}/${attempts}`,
+      url, timeoutMs: LANGFLOW_TIMEOUT_MS,
+      sessionId, body: truncate(JSON.stringify(payload), 300),
+      hasApiKey: !!process.env.LANGFLOW_API_KEY,
+    });
 
-  const contentType = resp.headers.get("content-type") || "";
-  const raw = await resp.text();
+    try {
+      const resp = await fetchWithTimeout(
+        url,
+        { method: "POST", headers, body: JSON.stringify(payload) },
+        LANGFLOW_TIMEOUT_MS
+      );
 
-  log("debug", "langflow.response", {
-    reqId, status: resp.status, ok: resp.ok,
-    contentType, raw: truncate(raw, 500),
-  });
+      const contentType = resp.headers.get("content-type") || "";
+      const raw = await resp.text();
 
-  if (!resp.ok) throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+      log("debug", "langflow.response", {
+        reqId, attempt: `${i}/${attempts}`,
+        status: resp.status, ok: resp.ok, contentType,
+        raw: truncate(raw, 500),
+      });
 
-  // Si no parece JSON (o parece HTML), forzamos fallback devolviendo vacío
-  const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
-  const looksJson = contentType.includes("application/json");
-  if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
-    log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
-    return "";
+      if (!resp.ok) {
+        // 4xx no suelen mejorar con retry, salvo 429
+        if (resp.status >= 500 || resp.status === 429) {
+          lastErr = new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+          // backoff y reintento
+        } else {
+          // 403, 400, etc: no reintentar
+          throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+        }
+      } else {
+        // OK -> validar que sea JSON
+        const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
+        const looksJson = contentType.includes("application/json");
+        if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
+          log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
+          return ""; // fallback
+        }
+        let json;
+        try { json = JSON.parse(raw); }
+        catch {
+          log("warn", "langflow.parse_failed", { reqId, rawPreview: truncate(raw, 200) });
+          return "";
+        }
+        const out = (pickTextFromLangflow(json) || "").trim();
+        log("debug", "langflow.extracted", { reqId, outPreview: truncate(out, 300) });
+        return out;
+      }
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      const abortLike = /aborted|timeout|The operation was aborted|This operation was aborted/i.test(msg);
+      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, error: msg });
+
+      if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
+        if (i < attempts) {
+          const delay = Math.min(1000 * i * i, 4000); // 1s, 4s, 9s… (cap 4s)
+          log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
+          await sleep(delay);
+          continue;
+        }
+      }
+      break; // sin condiciones para retry
+    }
   }
-
-  let json;
-  try { json = JSON.parse(raw); }
-  catch {
-    log("warn", "langflow.parse_failed", { reqId, rawPreview: truncate(raw, 200) });
-    return "";
-  }
-
-  const out = (pickTextFromLangflow(json) || "").trim();
-  log("debug", "langflow.extracted", { reqId, outPreview: truncate(out, 300) });
-  return out;
+  throw lastErr || new Error("Langflow no respondió");
 }
 
 // ---------------------- Middleware ----------------------
@@ -253,6 +288,7 @@ app.listen(PORT, () => {
     flowId: process.env.LANGFLOW_FLOW_ID || null,
     hasApiKey: !!process.env.LANGFLOW_API_KEY,
     timeoutMs: LANGFLOW_TIMEOUT_MS,
+    retries: LANGFLOW_RETRIES,
     logLevel: LOG_LEVEL,
   });
 });
