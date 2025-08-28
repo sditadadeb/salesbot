@@ -1,20 +1,21 @@
 // index.js
-// Bot Google Chat ↔ Langflow (Render)
+// Bot Google Chat ↔ Langflow (Render) con respuesta rápida y fallback
 // ENV aceptadas:
-// - LANGFLOW_API_HOST  (o LANGFLOW_HOST)  ← se aceptan ambas
+// - LANGFLOW_API_HOST  (o LANGFLOW_HOST)
 // - LANGFLOW_FLOW_ID
 // - LANGFLOW_API_KEY
-// - SESSION_STRATEGY   (opcional: thread | space | space_user | user) [default: thread]
-// - LANGFLOW_TIMEOUT_MS (opcional, default 15000)
-// - LANGFLOW_RETRIES    (opcional, default 2)
-// - PORT (Render la setea)
+// - SESSION_STRATEGY       (opcional: thread | space | space_user | user) [default: thread]
+// - LANGFLOW_TIMEOUT_MS    (opcional, default 15000)  -> timeout duro de la llamada a Langflow
+// - SYNC_CUTOFF_MS         (opcional, default 2200)   -> tope para RESPONDER a Chat con algo visible
+// - LANGFLOW_RETRIES       (opcional, default 0)      -> reintentos a Langflow (cuidado con la latencia)
+// - PORT                   (Render la setea)
 
 "use strict";
 
 const express = require("express");
 const { randomUUID } = require("crypto");
 
-// ----------------- Utils de log -----------------
+// ---------- utils de log ----------
 function log(level, msg, meta = {}) {
   try { console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta })); }
   catch { console.log(`[${level}] ${msg}`); }
@@ -28,14 +29,15 @@ function preview(obj, n = 1000) {
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function stripTrailingSlash(u){ return (u || "").replace(/\/+$/, ""); }
 
-// ----------------- ENV y defaults -----------------
-const LANGFLOW_HOST_ENV = process.env.LANGFLOW_API_HOST || process.env.LANGFLOW_HOST || "";
-const LANGFLOW_FLOW_ID  = process.env.LANGFLOW_FLOW_ID || "";
-const LANGFLOW_API_KEY  = process.env.LANGFLOW_API_KEY || "";
-const SESSION_STRATEGY  = (process.env.SESSION_STRATEGY || "thread").toLowerCase();
+// ---------- ENV ----------
+const LANGFLOW_HOST_ENV   = process.env.LANGFLOW_API_HOST || process.env.LANGFLOW_HOST || "";
+const LANGFLOW_FLOW_ID    = process.env.LANGFLOW_FLOW_ID || "";
+const LANGFLOW_API_KEY    = process.env.LANGFLOW_API_KEY || "";
+const SESSION_STRATEGY    = (process.env.SESSION_STRATEGY || "thread").toLowerCase();
 const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 15000);
-const LANGFLOW_RETRIES    = Number(process.env.LANGFLOW_RETRIES || 2);
-const PORT = process.env.PORT || 3000;
+const SYNC_CUTOFF_MS      = Number(process.env.SYNC_CUTOFF_MS || 2200);
+const LANGFLOW_RETRIES    = Number(process.env.LANGFLOW_RETRIES || 0);
+const PORT                = process.env.PORT || 3000;
 
 if (!LANGFLOW_HOST_ENV || !LANGFLOW_FLOW_ID || !LANGFLOW_API_KEY) {
   log("error", "Faltan variables de entorno requeridas", {
@@ -51,14 +53,13 @@ if (!LANGFLOW_HOST_ENV || !LANGFLOW_FLOW_ID || !LANGFLOW_API_KEY) {
 
 const LANGFLOW_URL = `${stripTrailingSlash(LANGFLOW_HOST_ENV)}/api/v1/run/${LANGFLOW_FLOW_ID}`;
 
-// ----------------- App -----------------
+// ---------- app ----------
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Health
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-// Egress IP (para allowlist)
+// Egress IP para allowlist
 app.get("/egress", async (_req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json");
@@ -71,18 +72,19 @@ app.get("/egress", async (_req, res) => {
   }
 });
 
-// (Opcional) ver config (sin exponer API key)
+// Config (sin exponer secretos)
 app.get("/config", (_req, res) => {
   res.json({
     langflowUrl: LANGFLOW_URL,
     sessionStrategy: SESSION_STRATEGY,
     timeoutMs: LANGFLOW_TIMEOUT_MS,
+    syncCutoffMs: SYNC_CUTOFF_MS,
     retries: LANGFLOW_RETRIES,
     hasApiKey: !!LANGFLOW_API_KEY,
   });
 });
 
-// ----------------- Helpers Google Chat -----------------
+// ---------- helpers Chat ----------
 function parseChatEvent(body) {
   const mp = body?.chat?.messagePayload || {};
   const space = mp.space || body?.space || {};
@@ -100,51 +102,30 @@ function parseChatEvent(body) {
 
   let textRaw = message.argumentText || message.text || "";
   textRaw = (textRaw || "").trim();
-  textRaw = textRaw.replace(/^@\S+\s*/, ""); // limpia "@bot ..."
+  textRaw = textRaw.replace(/^@\S+\s*/, ""); // limpia @bot al inicio
 
-  return {
-    userEmail: user.email,
-    spaceName,
-    isDM,
-    threadName,
-    textRaw,
-  };
+  return { userEmail: user.email, spaceName, isDM, threadName, textRaw };
 }
 
 function computeSessionId({ strategy, isDM, threadName, spaceName, userEmail }) {
-  // Forzamos sesiones estables en DM:
-  const effStrategy = isDM ? "space_user" : (strategy || "thread");
-  switch (effStrategy) {
-    case "space":
-      return spaceName || threadName || userEmail || "default_session";
-    case "space_user":
-      return `${spaceName || "space"}:${userEmail || "anon"}`;
-    case "user":
-      return userEmail || spaceName || threadName || "default_session";
+  const eff = isDM ? "space_user" : (strategy || "thread");
+  switch (eff) {
+    case "space":       return spaceName || threadName || userEmail || "default_session";
+    case "space_user":  return `${spaceName || "space"}:${userEmail || "anon"}`;
+    case "user":        return userEmail || spaceName || threadName || "default_session";
     case "thread":
-    default:
-      return threadName || spaceName || userEmail || "default_session";
+    default:            return threadName || spaceName || userEmail || "default_session";
   }
 }
 
-function buildChatReply(text, threadName) {
-  const message = { text: text || "" };
-  if (threadName) message.thread = { name: threadName };
-  return {
-    hostAppDataAction: {
-      chatDataAction: {
-        createMessageAction: { message },
-      },
-    },
-    text: message.text,      // fallback
-    thread: message.thread,  // fallback
-  };
+function buildPlainReply(text, threadName) {
+  const out = { text: text || "" };
+  if (threadName) out.thread = { name: threadName };
+  return out; // <- RESPUESTA PLANA (sin hostAppDataAction)
 }
 
-// ----------------- Langflow -----------------
-function looksHtml(s) {
-  return /^\s*</.test(s || "");
-}
+// ---------- Langflow ----------
+function looksHtml(s) { return /^\s*</.test(s || ""); }
 
 async function callLangflow({ text, sessionId, reqId }) {
   const payload = {
@@ -154,14 +135,13 @@ async function callLangflow({ text, sessionId, reqId }) {
     session_id: sessionId || "default_session",
   };
 
+  const attempts = Math.max(0, LANGFLOW_RETRIES) + 1;
   let lastErr;
-  const attempts = LANGFLOW_RETRIES + 1;
 
   for (let i = 1; i <= attempts; i++) {
     log("debug", "langflow.request", {
-      reqId, attempt: `${i}/${attempts}`,
-      url: LANGFLOW_URL, timeoutMs: LANGFLOW_TIMEOUT_MS,
-      sessionId, body: preview(payload, 300), hasApiKey: !!LANGFLOW_API_KEY,
+      reqId, attempt: `${i}/${attempts}`, url: LANGFLOW_URL,
+      timeoutMs: LANGFLOW_TIMEOUT_MS, sessionId, body: preview(payload, 300), hasApiKey: !!LANGFLOW_API_KEY,
     });
 
     const controller = new AbortController();
@@ -180,62 +160,40 @@ async function callLangflow({ text, sessionId, reqId }) {
       const raw = await r.text();
 
       log("debug", "langflow.response", {
-        reqId, attempt: `${i}/${attempts}`, status: r.status, ok: r.ok,
-        contentType, raw: preview(raw, 500),
+        reqId, attempt: `${i}/${attempts}`, status: r.status, ok: r.ok, contentType, raw: preview(raw, 500),
       });
 
       if (!r.ok) {
-        if (r.status === 403) {
-          throw new Error(`403_FORBIDDEN ${raw}`);
-        }
-        if (r.status >= 500 || r.status === 429) {
-          lastErr = new Error(`Langflow HTTP ${r.status}: ${raw}`);
-          // retry con backoff
-        } else {
-          throw new Error(`Langflow HTTP ${r.status}: ${raw}`);
-        }
+        if (r.status === 403) throw new Error(`403_FORBIDDEN ${raw}`);
+        if (r.status >= 500 || r.status === 429) { lastErr = new Error(`Langflow HTTP ${r.status}: ${raw}`); }
+        else throw new Error(`Langflow HTTP ${r.status}: ${raw}`);
       } else {
-        if (looksHtml(raw) || (!contentType.includes("json") && !raw.trim().startsWith("{"))) {
-          log("warn", "langflow.non_json_response", { reqId, contentType });
-          return ""; // forzamos fallback amable
-        }
-        let json;
-        try { json = JSON.parse(raw); }
-        catch { return ""; }
-        const textOut = extractText(json);
-        return (textOut || "").trim();
+        if (looksHtml(raw) || (!contentType.includes("json") && !raw.trim().startsWith("{"))) return "";
+        let json; try { json = JSON.parse(raw); } catch { return ""; }
+        const txt = extractText(json);
+        return (txt || "").trim();
       }
     } catch (e) {
       clearTimeout(timer);
+      lastErr = e;
       const msg = String(e?.message || e);
-      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, error: msg });
-
       const abortLike = /aborted|timeout/i.test(msg);
       const retriable = abortLike || /Langflow HTTP (5\d\d|429)/i.test(msg);
-      if (retriable && i < attempts) {
-        const delay = Math.min(1000 * i * i, 4000); // 1s, 4s, 9s... cap 4s
-        log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
-        await sleep(delay);
-        continue;
-      }
-      lastErr = e;
+      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, error: msg });
+      if (retriable && i < attempts) { await sleep(Math.min(1000 * i * i, 4000)); continue; }
       break;
     }
   }
   throw lastErr || new Error("Langflow no respondió");
 }
 
-// Extrae texto desde distintas formas de respuesta de Langflow
 function extractText(raw) {
   if (raw == null) return "";
   if (typeof raw === "string") return raw;
 
-  // 1) Claves frecuentes
   for (const k of ["text", "message", "output", "content", "result"]) {
     if (typeof raw[k] === "string" && raw[k].trim()) return raw[k];
   }
-
-  // 2) outputs[] anidados
   try {
     const outs = raw.outputs;
     if (Array.isArray(outs)) {
@@ -247,17 +205,16 @@ function extractText(raw) {
             if (typeof o2?.message === "string") return o2.message;
             if (typeof o2?.output_text === "string") return o2.output_text;
             if (o2?.data?.text) return String(o2.data.text);
+            if (o2?.results?.message?.data?.text) return String(o2.results.message.data.text);
             if (o2?.artifacts?.text) return String(o2.artifacts.text);
           }
         }
       }
     }
   } catch {}
-
-  // 3) Búsqueda profunda
+  // búsqueda profunda
   try {
-    const stack = [raw];
-    const seen = new Set();
+    const stack = [raw], seen = new Set();
     while (stack.length) {
       const cur = stack.pop();
       if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
@@ -269,7 +226,7 @@ function extractText(raw) {
   return "";
 }
 
-// ----------------- Webhook -----------------
+// ---------- Webhook ----------
 app.post("/events", async (req, res) => {
   const reqId = randomUUID();
   log("info", "http.request", {
@@ -285,9 +242,9 @@ app.post("/events", async (req, res) => {
   const parsed = parseChatEvent(body);
   log("info", "chat.event.parsed", { reqId, ...parsed });
 
+  // Mensajes tipo "bot agregado" llegan sin texto: devolver bienvenida simple.
   if (!parsed.textRaw) {
-    // evento sin texto (alta al espacio, etc.)
-    const welcome = buildChatReply("¡Gracias por invitarme! Decime algo y lo paso por el agente.", parsed.threadName);
+    const welcome = buildPlainReply("¡Gracias por invitarme! Decime algo y lo paso por el agente.", parsed.threadName);
     log("debug", "chat.reply.welcome", { reqId, replyPreview: preview(welcome) });
     return res.status(200).json(welcome);
   }
@@ -300,34 +257,47 @@ app.post("/events", async (req, res) => {
     userEmail: parsed.userEmail,
   });
 
-  let textOut = "";
-  try {
-    textOut = await callLangflow({ text: parsed.textRaw, sessionId, reqId });
-  } catch (e) {
-    const msg = String(e?.message || e);
-    log("error", "langflow.error", { reqId, error: msg });
-    if (/403_FORBIDDEN/i.test(msg) || /Client IP not allowed/i.test(msg)) {
-      textOut = "No tengo permiso para hablar con el agente (IP bloqueada). Pedí que allowlisteen mi IP de salida.";
+  // --- RESPUESTA RÁPIDA: race entre Langflow y cutoff síncrono ---
+  const lfPromise = (async () => {
+    try {
+      const txt = await callLangflow({ text: parsed.textRaw, sessionId, reqId });
+      return { type: "lf", text: txt || "" };
+    } catch (e) {
+      const msg = String(e?.message || e);
+      log("error", "langflow.error", { reqId, error: msg });
+      if (/403_FORBIDDEN/i.test(msg) || /Client IP not allowed/i.test(msg)) {
+        return { type: "lf", text: "No tengo permiso para hablar con el agente (IP bloqueada). Pedí que allowlisteen mi IP de salida." };
+      }
+      return { type: "lf", text: "" }; // caerá al fallback
     }
+  })();
+
+  const cutoffPromise = new Promise(resolve => setTimeout(() => resolve({ type: "cutoff" }), SYNC_CUTOFF_MS));
+
+  const winner = await Promise.race([lfPromise, cutoffPromise]);
+
+  let replyText;
+  if (winner.type === "lf" && winner.text) {
+    replyText = winner.text; // llegó Langflow a tiempo
+  } else {
+    // cutoff: responder algo visible YA
+    replyText = `recibido. tu mensaje fue: "${parsed.textRaw}"`;
+    log("warn", "sync.cutoff.fallback_used", { reqId, cutoffMs: SYNC_CUTOFF_MS });
   }
 
-  if (!textOut) {
-    textOut = `recibido. tu mensaje fue: "${parsed.textRaw}"`;
-    log("warn", "langflow.empty_output_fallback", { reqId });
-  }
-
-  const reply = buildChatReply(textOut, parsed.threadName);
+  const reply = buildPlainReply(replyText, parsed.threadName);
   log("info", "chat.reply.sending", { reqId, replyPreview: preview(reply) });
-  res.status(200).json(reply);
+  return res.status(200).json(reply);
 });
 
-// ----------------- Start -----------------
+// ---------- start ----------
 app.listen(PORT, () => {
   log("info", "server.started", {
     port: PORT,
     langflowUrl: LANGFLOW_URL,
     sessionStrategy: SESSION_STRATEGY,
     timeoutMs: LANGFLOW_TIMEOUT_MS,
+    syncCutoffMs: SYNC_CUTOFF_MS,
     retries: LANGFLOW_RETRIES,
     hasApiKey: !!LANGFLOW_API_KEY,
   });
