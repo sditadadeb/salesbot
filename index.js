@@ -129,6 +129,20 @@ app.get("/sessions", (req, res) => {
     res.json(sessionsInfo);
 });
 
+
+// Egress IP (para allowlist en Langflow)
+app.get("/egress", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    const j = await r.json();
+    log("info", "egress.ip", { ip: j.ip });
+    res.json(j);
+  } catch (e) {
+    log("warn", "egress.ip.failed", { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/session/:sessionId", (req, res) => {
     const sessionId = req.params.sessionId;
     res.json({
