@@ -1,16 +1,5 @@
 // index.js
 // Bot de Google Chat (HTTP Add-on) + Langflow con reintentos, logs y **memoria local** por sesión
-// ENV requeridas:
-//  - LANGFLOW_HOST        (p.ej. https://api.journey-builder.qa.numia.co)
-//  - LANGFLOW_FLOW_ID     (UUID del flow)
-//  - LANGFLOW_API_KEY     (API key de Langflow)
-//  - PORT                 (opcional; Render la setea)
-//  - LANGFLOW_TIMEOUT_MS  (opcional; default 15000)
-//  - LANGFLOW_RETRIES     (opcional; default 2)
-//  - LOG_LEVEL            (opcional: debug|info|warn|error; default debug)
-//  - HISTORY_TURNS        (opcional; cantidad de pares usuario/bot a mantener, default 8)
-//  - DISABLE_LOCAL_MEMORY (opcional; "1" para no inyectar historial al prompt)
-
 const express = require("express");
 const crypto = require("crypto");
 
@@ -38,15 +27,10 @@ function truncate(s, n = 500) {
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 // ---------------------- Memoria local por sesión ----------------------
-// Nota: esto es memoria en-proc. Si Render escala múltiples instancias o
-// reinicia, el historial se pierde. Para prod, usar Redis/DB externa.
 const mem = new Map(); // sessionId -> [{role:"user"|"bot", text, ts}, ...]
 
 function getHistory(sessionId) {
   return mem.get(sessionId) || [];
-}
-function setHistory(sessionId, arr) {
-  mem.set(sessionId, arr);
 }
 function pushTurn(sessionId, role, text) {
   const arr = mem.get(sessionId) || [];
@@ -162,21 +146,17 @@ async function callLangflow(userText, sessionId, reqId) {
       });
 
       if (!resp.ok) {
-        // 4xx no suelen mejorar con retry, salvo 429
         if (resp.status >= 500 || resp.status === 429) {
           lastErr = new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
-          // backoff y reintento
         } else {
-          // 403, 400, etc: no reintentar
           throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
         }
       } else {
-        // OK -> validar que sea JSON
         const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
         const looksJson = contentType.includes("application/json");
         if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
           log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
-          return ""; // fallback
+          return "";
         }
         let json;
         try { json = JSON.parse(raw); }
@@ -196,13 +176,13 @@ async function callLangflow(userText, sessionId, reqId) {
 
       if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
         if (i < attempts) {
-          const delay = Math.min(1000 * i * i, 4000); // 1s, 4s, 9s… (cap 4s)
+          const delay = Math.min(1000 * i * i, 4000);
           log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
           await sleep(delay);
           continue;
         }
       }
-      break; // sin condiciones para retry
+      break;
     }
   }
   throw lastErr || new Error("Langflow no respondió");
@@ -242,7 +222,6 @@ app.get("/egress", async (req, res) => {
 
 // ---------------------- Utilidades de sesión ----------------------
 function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
-  // Prioridad: hilo explícito > DM (usuario) > espacio (pseudo-hilo) > fallback por mensaje
   if (threadName) return `thread:${threadName}`;
   if (isDM) return `dm:${userEmail || "unknown"}`;
   if (spaceName) return `space:${spaceName}:default-thread`;
@@ -253,7 +232,6 @@ function buildUserPrompt(sessionId, textRaw) {
   if (DISABLE_LOCAL_MEMORY || HISTORY_TURNS === 0) return textRaw;
   const history = renderHistory(sessionId);
   if (!history) return textRaw;
-  // Inyectamos el contexto como prefacio claro y delimitado
   return [
     "<<<HISTORIAL_CONVERSACION>>>",
     history,
@@ -264,67 +242,58 @@ function buildUserPrompt(sessionId, textRaw) {
 }
 
 // ---------------------- Webhook Google Chat ----------------------
-app.post("/webhook", async (req, res) => {
+// CAMBIO IMPORTANTE: La ruta debe ser /events, no /webhook
+app.post("/events", async (req, res) => {
   const reqId = req.reqId;
-  const payload = req.body || {};
-  log("debug", "chat.event.received", { reqId, bodyPreview: truncate(JSON.stringify(payload), 1000) });
+  const body = req.body || {};
+  log("debug", "chat.event.received", { reqId, bodyPreview: truncate(JSON.stringify(body), 1000) });
 
-  // extraemos messagePayload (para Chats nuevos) o directo del payload
-  const event = payload.get ? payload.get("messagePayload", payload) : 
-                 payload.messagePayload || payload;
+  // Estructura del payload de Google Chat
+  const mp = body?.chat?.messagePayload;
+  const msg = mp?.message;
+  const threadName = msg?.thread?.name;
+  const spaceName = mp?.space?.name;
+  const isDM = mp?.space?.type === "DM";
+  const userEmail = body?.chat?.user?.email;
+  const textRaw = (msg?.argumentText ?? msg?.formattedText ?? msg?.text ?? "").trim();
 
-  // espacio y mensaje
-  const space = event.space || {};
-  const message = event.message;
-  if (!message) {
-    log("debug", "chat.no_message", { reqId });
-    return res.status(200).json({});
-  }
-
-  // limpiamos el texto de la mención
-  const raw_text = message.text || "";
-  const argument = (message.argumentText || raw_text).trim();
-
-  // hilo
-  const thread = message.thread || {};
-  const thread_name = thread.name;
-
-  // detectamos DM vs ROOM con hilos
-  const is_dm = (space.type === "DIRECT_MESSAGE");
-  const threading_state = space.spaceThreadingState;
-
-  // usuario
-  const user = event.user || {};
-  const userEmail = user.email;
-
-  log("debug", "chat.parsed", {
-    reqId,
-    spaceName: space.name,
-    threadName: thread_name,
-    isDM: is_dm,
-    userEmail,
-    threadingState: threading_state,
-    textRaw: truncate(argument, 200)
+  log("info", "chat.event.parsed", {
+    reqId, userEmail, spaceName, isDM, threadName, textRaw,
   });
 
-  // computar sesión estable
-  const sessionId = computeSessionId({
-    threadName: thread_name,
-    isDM: is_dm,
-    userEmail,
-    spaceName: space.name,
-    msg: message
+  // Si no hay mensaje (ej: alta al espacio)
+  if (!msg) {
+    const welcome = {
+      hostAppDataAction: {
+        chatDataAction: {
+          createMessageAction: {
+            message: { text: "¡Gracias por invitarme! Escribeme algo y te responderé con contexto." },
+          },
+        },
+      },
+    };
+    log("debug", "chat.reply.welcome", { reqId });
+    return res.status(200).json(welcome);
+  }
+
+  // Computar session ID estable
+  const sessionId = computeSessionId({ 
+    threadName, 
+    isDM, 
+    userEmail, 
+    spaceName, 
+    msg 
   });
 
   log("info", "chat.session", { reqId, sessionId });
 
-  // agregar mensaje del usuario al historial antes de procesarlo
+  // Agregar mensaje del usuario al historial
   if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
-    pushTurn(sessionId, "user", argument);
+    pushTurn(sessionId, "user", textRaw);
   }
 
-  // preparar input con memoria local
-  const inputForAgent = buildUserPrompt(sessionId, argument);
+  // Preparar input con memoria local
+  const inputForAgent = buildUserPrompt(sessionId, textRaw);
 
   let agentText = "";
   try {
@@ -339,30 +308,34 @@ app.post("/webhook", async (req, res) => {
   }
 
   if (!agentText) {
-    agentText = `Recibí tu mensaje: "${argument}"`;
+    agentText = `Recibí tu mensaje: "${textRaw}" (sesión: ${sessionId.slice(0, 8)})`;
     log("warn", "langflow.empty_output_fallback", { reqId });
   }
 
-  // agregar respuesta del bot al historial
+  // Agregar respuesta del bot al historial
   if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
     pushTurn(sessionId, "bot", agentText);
   }
 
-  const response_payload = { text: agentText };
+  const message = { text: agentText };
+  if (threadName) message.thread = { name: threadName };
 
-  // si es sala con hilos, devolvemos en el mismo hilo
-  if (!is_dm && threading_state === "THREADED_MESSAGES" && thread_name) {
-    response_payload.thread = { name: thread_name };
-  }
+  const reply = {
+    hostAppDataAction: {
+      chatDataAction: {
+        createMessageAction: { message },
+      },
+    },
+  };
 
-  log("info", "chat.response", { 
+  log("info", "chat.reply.sending", { 
     reqId, 
     sessionId,
     historyLength: getHistory(sessionId).length,
-    responsePreview: truncate(agentText, 200)
+    replyPreview: truncate(agentText, 200)
   });
 
-  return res.status(200).json(response_payload);
+  return res.status(200).json(reply);
 });
 
 // Debug endpoint para ver sesiones activas
