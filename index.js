@@ -1,161 +1,396 @@
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-import logging
-import httpx
-import os
-from typing import Dict, List, Optional
-import hashlib
+// index.js
+// Bot de Google Chat (HTTP Add-on) + Langflow con reintentos, logs y **memoria local** por sesión
+// ENV requeridas:
+//  - LANGFLOW_HOST        (p.ej. https://api.journey-builder.qa.numia.co)
+//  - LANGFLOW_FLOW_ID     (UUID del flow)
+//  - LANGFLOW_API_KEY     (API key de Langflow)
+//  - PORT                 (opcional; Render la setea)
+//  - LANGFLOW_TIMEOUT_MS  (opcional; default 15000)
+//  - LANGFLOW_RETRIES     (opcional; default 2)
+//  - LOG_LEVEL            (opcional: debug|info|warn|error; default debug)
+//  - HISTORY_TURNS        (opcional; cantidad de pares usuario/bot a mantener, default 8)
+//  - DISABLE_LOCAL_MEMORY (opcional; "1" para no inyectar historial al prompt)
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("sales-bot")
+const express = require("express");
+const crypto = require("crypto");
 
-app = FastAPI()
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 15000);
+const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES || 2);
+const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS || 8));
+const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
 
-# Sistema de memoria simple en memoria (para producción usar Redis/DB)
-session_memory: Dict[str, List[Dict[str, str]]] = {}
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+function log(level, msg, meta = {}) {
+  if ((LEVELS[level] || 99) < (LEVELS[LOG_LEVEL] || 99)) return;
+  const line = { ts: new Date().toISOString(), level, msg, ...meta };
+  try { console.log(JSON.stringify(line)); }
+  catch { console.log(`[${line.ts}] ${level.toUpperCase()} ${msg}`); }
+}
+function truncate(s, n = 500) {
+  if (!s) return "";
+  const str = String(s);
+  return str.length > n ? str.slice(0, n) + "…(trunc)" : str;
+}
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-def get_session_id(space: dict, thread: dict, message: dict) -> str:
-    """Genera un ID de sesión único basado en el contexto de Google Chat"""
-    space_name = space.get("name", "")
-    thread_name = thread.get("name", "")
-    
-    if thread_name:
-        # Si hay un hilo específico, usar ese como sesión
-        return f"thread:{thread_name}"
-    elif space_name:
-        # Si es un espacio sin hilo específico, usar el espacio
-        return f"space:{space_name}"
-    else:
-        # Fallback usando el nombre del mensaje
-        return f"message:{message.get('name', 'default')}"
+// ---------------------- Memoria local por sesión ----------------------
+// Nota: esto es memoria en-proc. Si Render escala múltiples instancias o
+// reinicia, el historial se pierde. Para prod, usar Redis/DB externa.
+const mem = new Map(); // sessionId -> [{role:"user"|"bot", text, ts}, ...]
 
-def add_to_memory(session_id: str, role: str, content: str, max_history: int = 10):
-    """Agrega un mensaje a la memoria de la sesión"""
-    if session_id not in session_memory:
-        session_memory[session_id] = []
-    
-    session_memory[session_id].append({
-        "role": role,
-        "content": content
-    })
-    
-    # Mantener solo los últimos max_history mensajes
-    if len(session_memory[session_id]) > max_history:
-        session_memory[session_id] = session_memory[session_id][-max_history:]
+function getHistory(sessionId) {
+  return mem.get(sessionId) || [];
+}
+function setHistory(sessionId, arr) {
+  mem.set(sessionId, arr);
+}
+function pushTurn(sessionId, role, text) {
+  const arr = mem.get(sessionId) || [];
+  arr.push({ role, text: String(text || ""), ts: Date.now() });
+  // Guardar solo los últimos N turnos (usuario+bot = 2*N items)
+  const maxItems = Math.max(1, HISTORY_TURNS) * 2;
+  if (arr.length > maxItems) arr.splice(0, arr.length - maxItems);
+  mem.set(sessionId, arr);
+}
+function renderHistory(sessionId) {
+  const arr = getHistory(sessionId);
+  if (!arr.length) return "";
+  // Formato simple, seguro y compacto. Evitamos JSON para no romper prompts.
+  return arr
+    .map(m => (m.role === "user" ? `USUARIO: ${m.text}` : `BOT: ${m.text}`))
+    .join("\n");
+}
 
-def get_conversation_context(session_id: str) -> str:
-    """Obtiene el contexto de conversación para la sesión"""
-    if session_id not in session_memory:
-        return ""
-    
-    context_parts = []
-    for msg in session_memory[session_id]:
-        role_label = "Usuario" if msg["role"] == "user" else "Bot"
-        context_parts.append(f"{role_label}: {msg['content']}")
-    
-    if context_parts:
-        return f"Contexto de conversación anterior:\n" + "\n".join(context_parts) + "\n\nNuevo mensaje:\n"
-    return ""
+// ---------------------- Langflow helpers ----------------------
+function buildLangflowRunUrl() {
+  const host = String(process.env.LANGFLOW_HOST || "").replace(/\/+$/, "");
+  const flowId = process.env.LANGFLOW_FLOW_ID || "";
+  if (!host || !flowId) return "";
+  return `${host}/api/v1/run/${flowId}`;
+}
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(id); }
+}
+function pickTextFromLangflow(json) {
+  if (typeof json === "string") return json;
+  if (typeof json?.text === "string") return json.text;
+  if (typeof json?.message === "string") return json.message;
+  if (typeof json?.output === "string") return json.output;
 
-def run_chain(user_input: str, session_id: str) -> str:
-    """Tu lógica de negocio o LLM con contexto de sesión"""
-    context = get_conversation_context(session_id)
-    full_prompt = context + user_input
-    
-    # Aquí puedes integrar con tu LLM/Langflow usando full_prompt
-    # Por ahora solo devolvemos un echo con contexto
-    response = f"Sales Bot (Sesión: {session_id[:20]}...): Recibí tu mensaje: {user_input}"
-    
-    # Agregar a memoria
-    add_to_memory(session_id, "user", user_input)
-    add_to_memory(session_id, "assistant", response)
-    
-    return response
-
-@app.get("/")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "ok", "message": "Sales Bot is running"}
-
-@app.get("/egress")
-async def get_egress_ip():
-    """Obtiene la IP de salida del servidor para configurar allowlist"""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get("https://api.ipify.org?format=json")
-            ip_data = response.json()
-            logger.info(f"IP de salida detectada: {ip_data.get('ip')}")
-            return ip_data
-    except Exception as e:
-        logger.error(f"Error obteniendo IP de salida: {str(e)}")
-        return {"error": f"No se pudo obtener la IP: {str(e)}"}
-
-@app.get("/sessions")
-async def get_active_sessions():
-    """Debug endpoint para ver sesiones activas"""
-    return {
-        "active_sessions": len(session_memory),
-        "sessions": {k: len(v) for k, v in session_memory.items()}
+  try {
+    const outs = json?.outputs;
+    if (Array.isArray(outs)) {
+      for (const o1 of outs) {
+        const o2s = o1?.outputs;
+        if (Array.isArray(o2s)) {
+          for (const o2 of o2s) {
+            if (typeof o2?.text === "string") return o2.text;
+            if (typeof o2?.message === "string") return o2.message;
+            if (typeof o2?.output_text === "string") return o2.output_text;
+            if (o2?.data?.text) return String(o2.data.text);
+            if (o2?.artifacts?.text) return String(o2.artifacts.text);
+          }
+        }
+      }
     }
+  } catch {}
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    payload = await request.json()
-    logger.debug("🔔 Payload completo recibido: %s", payload)
+  try {
+    const stack = [json];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+      seen.add(cur);
+      if (typeof cur.text === "string") return cur.text;
+      for (const k of Object.keys(cur)) stack.push(cur[k]);
+    }
+  } catch {}
+  return "";
+}
 
-    # Extraemos messagePayload (para Chats nuevos) o directo del payload
-    event = payload.get("messagePayload", payload)
+// Llamada a Langflow con protección contra HTML / no-JSON y reintentos
+async function callLangflow(userText, sessionId, reqId) {
+  const url = buildLangflowRunUrl();
+  if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
 
-    # Espacio y mensaje
-    space = event.get("space", {})
-    message = event.get("message")
-    if not message:
-        logger.debug("❗ No hay campo 'message' en el payload, ignorando evento.")
-        return {}
+  const payload = {
+    input_value: userText ?? "",
+    output_type: "chat",
+    input_type: "chat",
+    session_id: sessionId || "default_session",
+  };
 
-    # Limpiamos el texto de la mención
-    raw_text = message.get("text", "")
-    argument = message.get("argumentText", raw_text).strip()
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "x-api-key": process.env.LANGFLOW_API_KEY || "",
+  };
 
-    # Hilo
-    thread = message.get("thread", {})
-    thread_name = thread.get("name")
+  let lastErr;
+  const attempts = LANGFLOW_RETRIES + 1;
 
-    # Detectamos DM vs ROOM con hilos
-    is_dm = (space.get("type") == "DIRECT_MESSAGE")
-    threading_state = space.get("spaceThreadingState")
+  for (let i = 1; i <= attempts; i++) {
+    log("debug", "langflow.request", {
+      reqId, attempt: `${i}/${attempts}`,
+      url, timeoutMs: LANGFLOW_TIMEOUT_MS,
+      sessionId, body: truncate(JSON.stringify(payload), 300),
+      hasApiKey: !!process.env.LANGFLOW_API_KEY,
+    });
 
-    # Generamos session_id único para mantener contexto
-    session_id = get_session_id(space, thread, message)
+    try {
+      const resp = await fetchWithTimeout(
+        url,
+        { method: "POST", headers, body: JSON.stringify(payload) },
+        LANGFLOW_TIMEOUT_MS
+      );
 
-    logger.debug("   >> espacio: %s", space)
-    logger.debug("   >> mensaje: %s", message)
-    logger.debug("   >> texto limpio: '%s'", argument)
-    logger.debug("   >> session_id: %s", session_id)
-    logger.debug("   >> is_dm=%s, threading_state=%s, thread_name=%s",
-                 is_dm, threading_state, thread_name)
+      const contentType = resp.headers.get("content-type") || "";
+      const raw = await resp.text();
 
-    # Generamos respuesta con contexto de sesión
-    response_text = run_chain(argument or "<vacío>", session_id)
-    response_payload = {"text": response_text}
+      log("debug", "langflow.response", {
+        reqId, attempt: `${i}/${attempts}`,
+        status: resp.status, ok: resp.ok, contentType,
+        raw: truncate(raw, 500),
+      });
 
-    # Si es sala con hilos, devolvemos en el mismo hilo
-    if not is_dm and threading_state == "THREADED_MESSAGES" and thread_name:
-        response_payload["thread"] = {"name": thread_name}
+      if (!resp.ok) {
+        // 4xx no suelen mejorar con retry, salvo 429
+        if (resp.status >= 500 || resp.status === 429) {
+          lastErr = new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+          // backoff y reintento
+        } else {
+          // 403, 400, etc: no reintentar
+          throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
+        }
+      } else {
+        // OK -> validar que sea JSON
+        const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
+        const looksJson = contentType.includes("application/json");
+        if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
+          log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
+          return ""; // fallback
+        }
+        let json;
+        try { json = JSON.parse(raw); }
+        catch {
+          log("warn", "langflow.parse_failed", { reqId, rawPreview: truncate(raw, 200) });
+          return "";
+        }
+        const out = (pickTextFromLangflow(json) || "").trim();
+        log("debug", "langflow.extracted", { reqId, outPreview: truncate(out, 300) });
+        return out;
+      }
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      const abortLike = /aborted|timeout|The operation was aborted|This operation was aborted/i.test(msg);
+      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, error: msg });
 
-    logger.debug("DEBUG respuesta final a enviar: %s", response_payload)
-    return response_payload
+      if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
+        if (i < attempts) {
+          const delay = Math.min(1000 * i * i, 4000); // 1s, 4s, 9s… (cap 4s)
+          log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
+          await sleep(delay);
+          continue;
+        }
+      }
+      break; // sin condiciones para retry
+    }
+  }
+  throw lastErr || new Error("Langflow no respondió");
+}
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="debug")
+// ---------------------- Middleware ----------------------
+app.use(express.json({ limit: "2mb" }));
+app.use((req, _res, next) => {
+  const reqId = req.headers["x-request-id"] || crypto.randomUUID();
+  req.reqId = reqId;
+  log("info", "http.request", {
+    reqId, method: req.method, path: req.path,
+    ip: req.ip, ua: req.headers["user-agent"],
+    contentType: req.headers["content-type"],
+  });
+  next();
+});
+
+// Health
+app.get("/", (req, res) => {
+  log("debug", "healthcheck", { reqId: req.reqId });
+  res.status(200).send("OK");
+});
+
+// Egress IP (para allowlist en Langflow)
+app.get("/egress", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    const j = await r.json();
+    log("info", "egress.ip", { ip: j.ip });
+    res.json(j);
+  } catch (e) {
+    log("warn", "egress.ip.failed", { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------- Utilidades de sesión ----------------------
+function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
+  // Prioridad: hilo explícito > DM (usuario) > espacio (pseudo-hilo) > fallback por mensaje
+  if (threadName) return `thread:${threadName}`;
+  if (isDM) return `dm:${userEmail || "unknown"}`;
+  if (spaceName) return `space:${spaceName}:default-thread`;
+  return `fallback:${msg?.name || crypto.randomUUID()}`;
+}
+
+function buildUserPrompt(sessionId, textRaw) {
+  if (DISABLE_LOCAL_MEMORY || HISTORY_TURNS === 0) return textRaw;
+  const history = renderHistory(sessionId);
+  if (!history) return textRaw;
+  // Inyectamos el contexto como prefacio claro y delimitado
+  return [
+    "<<<HISTORIAL_CONVERSACION>>>",
+    history,
+    "<<<FIN_HISTORIAL>>>",
+    "\n",
+    textRaw
+  ].join("\n");
+}
+
+// ---------------------- Webhook Google Chat ----------------------
+app.post("/webhook", async (req, res) => {
+  const reqId = req.reqId;
+  const payload = req.body || {};
+  log("debug", "chat.event.received", { reqId, bodyPreview: truncate(JSON.stringify(payload), 1000) });
+
+  // extraemos messagePayload (para Chats nuevos) o directo del payload
+  const event = payload.get ? payload.get("messagePayload", payload) : 
+                 payload.messagePayload || payload;
+
+  // espacio y mensaje
+  const space = event.space || {};
+  const message = event.message;
+  if (!message) {
+    log("debug", "chat.no_message", { reqId });
+    return res.status(200).json({});
+  }
+
+  // limpiamos el texto de la mención
+  const raw_text = message.text || "";
+  const argument = (message.argumentText || raw_text).trim();
+
+  // hilo
+  const thread = message.thread || {};
+  const thread_name = thread.name;
+
+  // detectamos DM vs ROOM con hilos
+  const is_dm = (space.type === "DIRECT_MESSAGE");
+  const threading_state = space.spaceThreadingState;
+
+  // usuario
+  const user = event.user || {};
+  const userEmail = user.email;
+
+  log("debug", "chat.parsed", {
+    reqId,
+    spaceName: space.name,
+    threadName: thread_name,
+    isDM: is_dm,
+    userEmail,
+    threadingState: threading_state,
+    textRaw: truncate(argument, 200)
+  });
+
+  // computar sesión estable
+  const sessionId = computeSessionId({
+    threadName: thread_name,
+    isDM: is_dm,
+    userEmail,
+    spaceName: space.name,
+    msg: message
+  });
+
+  log("info", "chat.session", { reqId, sessionId });
+
+  // agregar mensaje del usuario al historial antes de procesarlo
+  if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
+    pushTurn(sessionId, "user", argument);
+  }
+
+  // preparar input con memoria local
+  const inputForAgent = buildUserPrompt(sessionId, argument);
+
+  let agentText = "";
+  try {
+    agentText = await callLangflow(inputForAgent, sessionId, reqId);
+  } catch (e) {
+    log("error", "langflow.error", { reqId, error: e.message });
+    if (/Client IP not allowed/i.test(String(e.message))) {
+      agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Avisá para allowlistear mi IP de salida.";
+    } else {
+      agentText = `Error al procesar tu mensaje: ${e.message}`;
+    }
+  }
+
+  if (!agentText) {
+    agentText = `Recibí tu mensaje: "${argument}"`;
+    log("warn", "langflow.empty_output_fallback", { reqId });
+  }
+
+  // agregar respuesta del bot al historial
+  if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
+    pushTurn(sessionId, "bot", agentText);
+  }
+
+  const response_payload = { text: agentText };
+
+  // si es sala con hilos, devolvemos en el mismo hilo
+  if (!is_dm && threading_state === "THREADED_MESSAGES" && thread_name) {
+    response_payload.thread = { name: thread_name };
+  }
+
+  log("info", "chat.response", { 
+    reqId, 
+    sessionId,
+    historyLength: getHistory(sessionId).length,
+    responsePreview: truncate(agentText, 200)
+  });
+
+  return res.status(200).json(response_payload);
+});
+
+// Debug endpoint para ver sesiones activas
+app.get("/sessions", (req, res) => {
+  const sessions = {};
+  for (const [sessionId, history] of mem.entries()) {
+    sessions[sessionId] = {
+      messageCount: history.length,
+      lastMessages: history.slice(-3).map(m => `${m.role}: ${truncate(m.text, 50)}`)
+    };
+  }
+  res.json({
+    totalSessions: mem.size,
+    sessions
+  });
+});
+
+// ---------------------- Start ----------------------
+app.listen(PORT, () => {
+  log("info", "server.started", {
+    port: PORT,
+    langflowHost: process.env.LANGFLOW_HOST || null,
+    flowId: process.env.LANGFLOW_FLOW_ID || null,
+    hasApiKey: !!process.env.LANGFLOW_API_KEY,
+    timeoutMs: LANGFLOW_TIMEOUT_MS,
+    retries: LANGFLOW_RETRIES,
+    logLevel: LOG_LEVEL,
+    historyTurns: HISTORY_TURNS,
+    disableLocalMemory: DISABLE_LOCAL_MEMORY,
+  });
+});
