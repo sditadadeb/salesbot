@@ -1,5 +1,5 @@
 // index.js
-// Bot de Google Chat (HTTP Add-on) + Langflow con reintentos, logs y **memoria local** por sesión
+// Bot de Google Chat con memoria híbrida (local + Langflow)
 const express = require("express");
 const crypto = require("crypto");
 
@@ -9,8 +9,9 @@ const PORT = process.env.PORT || 3000;
 const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
 const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 15000);
 const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES || 2);
-const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS || 8));
+const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS || 6));
 const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
+const USE_HYBRID_MEMORY = String(process.env.USE_HYBRID_MEMORY || "1") === "1";
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 function log(level, msg, meta = {}) {
@@ -28,23 +29,59 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 // ---------------------- Memoria local por sesión ----------------------
 const mem = new Map(); // sessionId -> [{role:"user"|"bot", text, ts}, ...]
+const sessionMetadata = new Map(); // sessionId -> {created, lastUsed, threadName, userEmail, etc}
 
 function getHistory(sessionId) {
   return mem.get(sessionId) || [];
 }
+
+function getSessionMetadata(sessionId) {
+  return sessionMetadata.get(sessionId) || {};
+}
+
+function updateSessionMetadata(sessionId, data) {
+  const existing = sessionMetadata.get(sessionId) || {};
+  sessionMetadata.set(sessionId, { ...existing, ...data, lastUsed: Date.now() });
+}
+
 function pushTurn(sessionId, role, text) {
   const arr = mem.get(sessionId) || [];
   arr.push({ role, text: String(text || ""), ts: Date.now() });
   const maxItems = Math.max(1, HISTORY_TURNS) * 2;
   if (arr.length > maxItems) arr.splice(0, arr.length - maxItems);
   mem.set(sessionId, arr);
+  
+  log("debug", "memory.turn_added", {
+    sessionId, role, textPreview: truncate(text, 100), 
+    totalTurns: arr.length, maxItems
+  });
 }
-function renderHistory(sessionId) {
+
+function renderHistoryForLangflow(sessionId) {
+  if (!USE_HYBRID_MEMORY) return "";
+  
   const arr = getHistory(sessionId);
   if (!arr.length) return "";
-  return arr
-    .map(m => (m.role === "user" ? `USUARIO: ${m.text}` : `BOT: ${m.text}`))
-    .join("\n");
+  
+  // Formato optimizado para Langflow - más natural
+  const contextLines = ["=== CONTEXTO DE CONVERSACIÓN ==="];
+  
+  // Tomar los últimos N turnos
+  const recentHistory = arr.slice(-Math.max(4, HISTORY_TURNS));
+  
+  for (const entry of recentHistory) {
+    if (entry.role === "user") {
+      contextLines.push(`Usuario preguntó: "${entry.text}"`);
+    } else {
+      contextLines.push(`Yo respondí: "${entry.text}"`);
+    }
+  }
+  
+  contextLines.push("=== FIN CONTEXTO ===");
+  contextLines.push("");
+  contextLines.push("Basándote en este contexto, responde a la siguiente pregunta:");
+  
+  return contextLines.join("\n");
 }
 
 // ---------------------- Langflow helpers ----------------------
@@ -54,12 +91,14 @@ function buildLangflowRunUrl() {
   if (!host || !flowId) return "";
   return `${host}/api/v1/run/${flowId}`;
 }
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try { return await fetch(url, { ...options, signal: controller.signal }); }
   finally { clearTimeout(id); }
 }
+
 function pickTextFromLangflow(json) {
   if (typeof json === "string") return json;
   if (typeof json?.text === "string") return json.text;
@@ -78,6 +117,7 @@ function pickTextFromLangflow(json) {
             if (typeof o2?.output_text === "string") return o2.output_text;
             if (o2?.data?.text) return String(o2.data.text);
             if (o2?.artifacts?.text) return String(o2.artifacts.text);
+            if (o2?.results?.message?.text) return String(o2.results.message.text);
           }
         }
       }
@@ -98,17 +138,28 @@ function pickTextFromLangflow(json) {
   return "";
 }
 
-// Llamada a Langflow con session_id consistente
+// Llamada a Langflow con memoria híbrida
 async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
 
+  // Construir input con contexto si está habilitado
+  let finalInput = userText;
+  if (USE_HYBRID_MEMORY && !DISABLE_LOCAL_MEMORY) {
+    const context = renderHistoryForLangflow(sessionId);
+    if (context) {
+      finalInput = context + "\n" + userText;
+    }
+  }
+
   const payload = {
-    input_value: userText ?? "",
+    input_value: finalInput,
     output_type: "chat",
     input_type: "chat",
-    session_id: sessionId, // CLAVE: usar el mismo sessionId consistente
-    tweaks: {} // Por si necesitas tweaks específicos
+    session_id: sessionId,
+    tweaks: {
+      // Puedes añadir tweaks específicos aquí si tu flow los necesita
+    }
   };
 
   const headers = {
@@ -124,7 +175,10 @@ async function callLangflow(userText, sessionId, reqId) {
     log("debug", "langflow.request", {
       reqId, attempt: `${i}/${attempts}`,
       url, timeoutMs: LANGFLOW_TIMEOUT_MS,
-      sessionId, body: truncate(JSON.stringify(payload), 300),
+      sessionId, 
+      originalInput: truncate(userText, 200),
+      finalInput: truncate(finalInput, 400),
+      hasContext: finalInput !== userText,
       hasApiKey: !!process.env.LANGFLOW_API_KEY,
     });
 
@@ -141,7 +195,7 @@ async function callLangflow(userText, sessionId, reqId) {
       log("debug", "langflow.response", {
         reqId, attempt: `${i}/${attempts}`,
         status: resp.status, ok: resp.ok, contentType,
-        raw: truncate(raw, 500),
+        raw: truncate(raw, 800),
       });
 
       if (!resp.ok) {
@@ -164,19 +218,19 @@ async function callLangflow(userText, sessionId, reqId) {
           return "";
         }
         const out = (pickTextFromLangflow(json) || "").trim();
-        log("debug", "langflow.extracted", { reqId, outPreview: truncate(out, 300) });
+        log("debug", "langflow.extracted", { reqId, sessionId, outPreview: truncate(out, 300) });
         return out;
       }
     } catch (e) {
       lastErr = e;
       const msg = String(e?.message || e);
       const abortLike = /aborted|timeout|The operation was aborted|This operation was aborted/i.test(msg);
-      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, error: msg });
+      log("warn", "langflow.attempt_failed", { reqId, attempt: `${i}/${attempts}`, sessionId, error: msg });
 
       if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
         if (i < attempts) {
           const delay = Math.min(1000 * i * i, 4000);
-          log("info", "langflow.retrying_after_backoff", { reqId, inMs: delay });
+          log("info", "langflow.retrying_after_backoff", { reqId, sessionId, inMs: delay });
           await sleep(delay);
           continue;
         }
@@ -206,7 +260,7 @@ app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// Egress IP (para allowlist en Langflow)
+// Egress IP
 app.get("/egress", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json");
@@ -221,45 +275,33 @@ app.get("/egress", async (req, res) => {
 
 // ---------------------- Utilidades de sesión ----------------------
 function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
-  // Generar un session_id más estable y simple para Langflow
   let sessionBase;
   
   if (threadName) {
-    // Para hilos específicos, usar el nombre del hilo directamente
-    sessionBase = threadName.replace(/^spaces\/[^\/]+\/threads\//, "thread_");
+    // Usar el thread name completo pero limpiarlo
+    sessionBase = threadName;
   } else if (isDM && userEmail) {
     // Para DMs, usar el email del usuario
-    sessionBase = `dm_${userEmail.replace(/[^a-zA-Z0-9]/g, "_")}`;
+    sessionBase = `dm_${userEmail}`;
   } else if (spaceName) {
     // Para espacios sin hilo específico
-    sessionBase = spaceName.replace(/^spaces\//, "space_");
+    sessionBase = `${spaceName}_default`;
   } else {
-    // Fallback
-    sessionBase = `fallback_${crypto.randomUUID()}`;
+    // Fallback usando el nombre del mensaje si existe
+    sessionBase = `fallback_${msg?.name || crypto.randomUUID()}`;
   }
 
-  // Hacer hash para que sea más corto y consistente
-  return crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 16);
-}
-
-function buildUserPrompt(sessionId, textRaw) {
-  if (DISABLE_LOCAL_MEMORY || HISTORY_TURNS === 0) return textRaw;
-  const history = renderHistory(sessionId);
-  if (!history) return textRaw;
-  return [
-    "<<<HISTORIAL_CONVERSACION>>>",
-    history,
-    "<<<FIN_HISTORIAL>>>",
-    "\n",
-    textRaw
-  ].join("\n");
+  // Crear hash consistente pero legible
+  const hash = crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 12);
+  return hash;
 }
 
 // ---------------------- Webhook Google Chat ----------------------
 app.post("/events", async (req, res) => {
   const reqId = req.reqId;
   const body = req.body || {};
-  log("debug", "chat.event.received", { reqId, bodyPreview: truncate(JSON.stringify(body), 1000) });
+  
+  log("debug", "chat.event.raw", { reqId, bodyPreview: truncate(JSON.stringify(body), 2000) });
 
   const mp = body?.chat?.messagePayload;
   const msg = mp?.message;
@@ -279,7 +321,9 @@ app.post("/events", async (req, res) => {
       hostAppDataAction: {
         chatDataAction: {
           createMessageAction: {
-            message: { text: "¡Gracias por invitarme! Escribeme algo y mantendré el contexto de nuestra conversación." },
+            message: { 
+              text: `¡Hola! Soy un bot con memoria. Puedo recordar nuestra conversación en este ${isDM ? 'chat directo' : 'hilo'}. ¡Pregúntame algo!`
+            },
           },
         },
       },
@@ -288,7 +332,7 @@ app.post("/events", async (req, res) => {
     return res.status(200).json(welcome);
   }
 
-  // CLAVE: Generar session ID consistente y estable
+  // Generar session ID consistente
   const sessionId = computeSessionId({ 
     threadName, 
     isDM, 
@@ -297,48 +341,54 @@ app.post("/events", async (req, res) => {
     msg 
   });
 
-  log("info", "chat.session_computed", { 
-    reqId, 
-    sessionId,
+  // Actualizar metadata de sesión
+  updateSessionMetadata(sessionId, {
     threadName,
     isDM,
-    userEmail: userEmail ? userEmail.substring(0, 10) + "..." : null,
-    spaceName: spaceName ? spaceName.substring(spaceName.lastIndexOf('/') + 1) : null
+    userEmail,
+    spaceName,
+    created: sessionMetadata.get(sessionId)?.created || Date.now()
   });
 
-  // Agregar mensaje del usuario al historial local (backup)
-  if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
-    pushTurn(sessionId, "user", textRaw);
-    log("debug", "chat.history_updated", { 
-      reqId, 
-      sessionId, 
-      localHistoryLength: getHistory(sessionId).length 
-    });
-  }
+  const metadata = getSessionMetadata(sessionId);
+  const history = getHistory(sessionId);
 
-  // NO usar buildUserPrompt - dejar que Langflow maneje la memoria
-  // const inputForAgent = buildUserPrompt(sessionId, textRaw);
-  const inputForAgent = textRaw; // Usar solo el texto actual
+  log("info", "chat.session_info", { 
+    reqId, 
+    sessionId,
+    isExistingSession: history.length > 0,
+    totalTurns: history.length,
+    sessionAge: metadata.created ? Date.now() - metadata.created : 0,
+    threadName: threadName ? truncate(threadName, 50) : null,
+    isDM,
+    userEmail: userEmail ? userEmail.substring(0, 10) + "..." : null
+  });
+
+  // Agregar mensaje del usuario al historial ANTES de llamar a Langflow
+  if (!DISABLE_LOCAL_MEMORY) {
+    pushTurn(sessionId, "user", textRaw);
+  }
 
   let agentText = "";
   try {
-    agentText = await callLangflow(inputForAgent, sessionId, reqId);
+    agentText = await callLangflow(textRaw, sessionId, reqId);
   } catch (e) {
     log("error", "langflow.error", { reqId, sessionId, error: e.message });
     if (/Client IP not allowed/i.test(String(e.message))) {
-      agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Avisá para allowlistear mi IP de salida.";
+      agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Revisa la configuración de IP allowlist.";
     } else {
       agentText = `Error al procesar tu mensaje: ${e.message}`;
     }
   }
 
   if (!agentText) {
-    agentText = `Recibí tu mensaje: "${textRaw}" (sesión: ${sessionId})`;
+    const historyCount = getHistory(sessionId).length;
+    agentText = `Recibí tu mensaje: "${textRaw}". Esta es nuestra conversación #${Math.ceil(historyCount/2)} (sesión: ${sessionId})`;
     log("warn", "langflow.empty_output_fallback", { reqId, sessionId });
   }
 
-  // Agregar respuesta del bot al historial local (backup)
-  if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
+  // Agregar respuesta del bot al historial DESPUÉS de recibir la respuesta
+  if (!DISABLE_LOCAL_MEMORY) {
     pushTurn(sessionId, "bot", agentText);
   }
 
@@ -353,28 +403,54 @@ app.post("/events", async (req, res) => {
     },
   };
 
+  const finalHistory = getHistory(sessionId);
   log("info", "chat.reply.sending", { 
     reqId, 
     sessionId,
-    localHistoryLength: getHistory(sessionId).length,
+    finalHistoryLength: finalHistory.length,
     replyPreview: truncate(agentText, 200)
   });
 
   return res.status(200).json(reply);
 });
 
-// Debug endpoint mejorado
+// Debug endpoints mejorados
 app.get("/sessions", (req, res) => {
   const sessions = {};
   for (const [sessionId, history] of mem.entries()) {
+    const metadata = getSessionMetadata(sessionId);
     sessions[sessionId] = {
       messageCount: history.length,
-      lastMessages: history.slice(-3).map(m => `${m.role}: ${truncate(m.text, 50)}`)
+      created: new Date(metadata.created || 0).toISOString(),
+      lastUsed: new Date(metadata.lastUsed || 0).toISOString(),
+      isDM: metadata.isDM,
+      threadName: metadata.threadName ? truncate(metadata.threadName, 50) : null,
+      userEmail: metadata.userEmail ? metadata.userEmail.substring(0, 15) + "..." : null,
+      lastMessages: history.slice(-4).map(m => `${m.role}: ${truncate(m.text, 60)}`)
     };
   }
   res.json({
     totalSessions: mem.size,
+    hybridMemory: USE_HYBRID_MEMORY,
+    maxHistoryTurns: HISTORY_TURNS,
     sessions
+  });
+});
+
+app.get("/sessions/:sessionId", (req, res) => {
+  const sessionId = req.params.sessionId;
+  const history = getHistory(sessionId);
+  const metadata = getSessionMetadata(sessionId);
+  
+  if (history.length === 0) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+  
+  res.json({
+    sessionId,
+    metadata,
+    messageCount: history.length,
+    messages: history
   });
 });
 
@@ -390,5 +466,6 @@ app.listen(PORT, () => {
     logLevel: LOG_LEVEL,
     historyTurns: HISTORY_TURNS,
     disableLocalMemory: DISABLE_LOCAL_MEMORY,
+    useHybridMemory: USE_HYBRID_MEMORY,
   });
 });
