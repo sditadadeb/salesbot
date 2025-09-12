@@ -35,7 +35,6 @@ function getHistory(sessionId) {
 function pushTurn(sessionId, role, text) {
   const arr = mem.get(sessionId) || [];
   arr.push({ role, text: String(text || ""), ts: Date.now() });
-  // Guardar solo los últimos N turnos (usuario+bot = 2*N items)
   const maxItems = Math.max(1, HISTORY_TURNS) * 2;
   if (arr.length > maxItems) arr.splice(0, arr.length - maxItems);
   mem.set(sessionId, arr);
@@ -43,7 +42,6 @@ function pushTurn(sessionId, role, text) {
 function renderHistory(sessionId) {
   const arr = getHistory(sessionId);
   if (!arr.length) return "";
-  // Formato simple, seguro y compacto. Evitamos JSON para no romper prompts.
   return arr
     .map(m => (m.role === "user" ? `USUARIO: ${m.text}` : `BOT: ${m.text}`))
     .join("\n");
@@ -100,7 +98,7 @@ function pickTextFromLangflow(json) {
   return "";
 }
 
-// Llamada a Langflow con protección contra HTML / no-JSON y reintentos
+// Llamada a Langflow con session_id consistente
 async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
@@ -109,7 +107,8 @@ async function callLangflow(userText, sessionId, reqId) {
     input_value: userText ?? "",
     output_type: "chat",
     input_type: "chat",
-    session_id: sessionId || "default_session",
+    session_id: sessionId, // CLAVE: usar el mismo sessionId consistente
+    tweaks: {} // Por si necesitas tweaks específicos
   };
 
   const headers = {
@@ -222,10 +221,25 @@ app.get("/egress", async (req, res) => {
 
 // ---------------------- Utilidades de sesión ----------------------
 function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
-  if (threadName) return `thread:${threadName}`;
-  if (isDM) return `dm:${userEmail || "unknown"}`;
-  if (spaceName) return `space:${spaceName}:default-thread`;
-  return `fallback:${msg?.name || crypto.randomUUID()}`;
+  // Generar un session_id más estable y simple para Langflow
+  let sessionBase;
+  
+  if (threadName) {
+    // Para hilos específicos, usar el nombre del hilo directamente
+    sessionBase = threadName.replace(/^spaces\/[^\/]+\/threads\//, "thread_");
+  } else if (isDM && userEmail) {
+    // Para DMs, usar el email del usuario
+    sessionBase = `dm_${userEmail.replace(/[^a-zA-Z0-9]/g, "_")}`;
+  } else if (spaceName) {
+    // Para espacios sin hilo específico
+    sessionBase = spaceName.replace(/^spaces\//, "space_");
+  } else {
+    // Fallback
+    sessionBase = `fallback_${crypto.randomUUID()}`;
+  }
+
+  // Hacer hash para que sea más corto y consistente
+  return crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 16);
 }
 
 function buildUserPrompt(sessionId, textRaw) {
@@ -242,13 +256,11 @@ function buildUserPrompt(sessionId, textRaw) {
 }
 
 // ---------------------- Webhook Google Chat ----------------------
-// CAMBIO IMPORTANTE: La ruta debe ser /events, no /webhook
 app.post("/events", async (req, res) => {
   const reqId = req.reqId;
   const body = req.body || {};
   log("debug", "chat.event.received", { reqId, bodyPreview: truncate(JSON.stringify(body), 1000) });
 
-  // Estructura del payload de Google Chat
   const mp = body?.chat?.messagePayload;
   const msg = mp?.message;
   const threadName = msg?.thread?.name;
@@ -267,7 +279,7 @@ app.post("/events", async (req, res) => {
       hostAppDataAction: {
         chatDataAction: {
           createMessageAction: {
-            message: { text: "¡Gracias por invitarme! Escribeme algo y te responderé con contexto." },
+            message: { text: "¡Gracias por invitarme! Escribeme algo y mantendré el contexto de nuestra conversación." },
           },
         },
       },
@@ -276,7 +288,7 @@ app.post("/events", async (req, res) => {
     return res.status(200).json(welcome);
   }
 
-  // Computar session ID estable
+  // CLAVE: Generar session ID consistente y estable
   const sessionId = computeSessionId({ 
     threadName, 
     isDM, 
@@ -285,21 +297,34 @@ app.post("/events", async (req, res) => {
     msg 
   });
 
-  log("info", "chat.session", { reqId, sessionId });
+  log("info", "chat.session_computed", { 
+    reqId, 
+    sessionId,
+    threadName,
+    isDM,
+    userEmail: userEmail ? userEmail.substring(0, 10) + "..." : null,
+    spaceName: spaceName ? spaceName.substring(spaceName.lastIndexOf('/') + 1) : null
+  });
 
-  // Agregar mensaje del usuario al historial
+  // Agregar mensaje del usuario al historial local (backup)
   if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
     pushTurn(sessionId, "user", textRaw);
+    log("debug", "chat.history_updated", { 
+      reqId, 
+      sessionId, 
+      localHistoryLength: getHistory(sessionId).length 
+    });
   }
 
-  // Preparar input con memoria local
-  const inputForAgent = buildUserPrompt(sessionId, textRaw);
+  // NO usar buildUserPrompt - dejar que Langflow maneje la memoria
+  // const inputForAgent = buildUserPrompt(sessionId, textRaw);
+  const inputForAgent = textRaw; // Usar solo el texto actual
 
   let agentText = "";
   try {
     agentText = await callLangflow(inputForAgent, sessionId, reqId);
   } catch (e) {
-    log("error", "langflow.error", { reqId, error: e.message });
+    log("error", "langflow.error", { reqId, sessionId, error: e.message });
     if (/Client IP not allowed/i.test(String(e.message))) {
       agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Avisá para allowlistear mi IP de salida.";
     } else {
@@ -308,11 +333,11 @@ app.post("/events", async (req, res) => {
   }
 
   if (!agentText) {
-    agentText = `Recibí tu mensaje: "${textRaw}" (sesión: ${sessionId.slice(0, 8)})`;
-    log("warn", "langflow.empty_output_fallback", { reqId });
+    agentText = `Recibí tu mensaje: "${textRaw}" (sesión: ${sessionId})`;
+    log("warn", "langflow.empty_output_fallback", { reqId, sessionId });
   }
 
-  // Agregar respuesta del bot al historial
+  // Agregar respuesta del bot al historial local (backup)
   if (!DISABLE_LOCAL_MEMORY && HISTORY_TURNS > 0) {
     pushTurn(sessionId, "bot", agentText);
   }
@@ -331,14 +356,14 @@ app.post("/events", async (req, res) => {
   log("info", "chat.reply.sending", { 
     reqId, 
     sessionId,
-    historyLength: getHistory(sessionId).length,
+    localHistoryLength: getHistory(sessionId).length,
     replyPreview: truncate(agentText, 200)
   });
 
   return res.status(200).json(reply);
 });
 
-// Debug endpoint para ver sesiones activas
+// Debug endpoint mejorado
 app.get("/sessions", (req, res) => {
   const sessions = {};
   for (const [sessionId, history] of mem.entries()) {
