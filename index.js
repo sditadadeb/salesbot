@@ -1,211 +1,142 @@
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-import logging
-import uuid
-from datetime import datetime
-from typing import Dict, List, Optional
+const express = require("express");
+const crypto = require("crypto");
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("sales-bot")
+const app = express();
+const PORT = process.env.PORT || 10000;
 
-app = FastAPI()
+// Almacén de memoria local por sesión
+const memoryStore = new Map(); // sessionId -> [messages]
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.use(express.json());
 
-# ---------------------- Memoria local por sesión ----------------------
-# sessionId -> [{"role": "user"|"bot", "text": str, "ts": datetime}, ...]
-session_memory: Dict[str, List[Dict]] = {}
-
-# Configuración de memoria
-HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "8"))  # pares de mensajes a mantener
-DISABLE_LOCAL_MEMORY = os.environ.get("DISABLE_LOCAL_MEMORY", "0") == "1"
-
-def get_session_history(session_id: str) -> List[Dict]:
-    """Obtiene el historial de una sesión"""
-    return session_memory.get(session_id, [])
-
-def push_turn(session_id: str, role: str, text: str):
-    """Agrega un turno (usuario o bot) al historial de la sesión"""
-    if DISABLE_LOCAL_MEMORY or HISTORY_TURNS == 0:
-        return
+function getSessionId(space, message, isDM) {
+    const thread = message?.thread;
+    const threadName = thread?.name;
     
-    if session_id not in session_memory:
-        session_memory[session_id] = []
+    if (threadName) {
+        return `thread:${threadName}`;
+    }
     
-    session_memory[session_id].append({
-        "role": role,
-        "text": str(text or ""),
-        "ts": datetime.now()
-    })
+    if (isDM) {
+        const userEmail = message?.sender?.email || "unknown";
+        return `dm:${userEmail}`;
+    }
     
-    # Mantener solo los últimos N turnos (usuario+bot = 2*N items)
-    max_items = max(1, HISTORY_TURNS) * 2
-    if len(session_memory[session_id]) > max_items:
-        session_memory[session_id] = session_memory[session_id][-max_items:]
+    const spaceName = space?.name || "unknown";
+    return `space:${spaceName}:default`;
+}
 
-def render_history(session_id: str) -> str:
-    """Renderiza el historial en formato de texto para el contexto"""
-    history = get_session_history(session_id)
-    if not history:
-        return ""
+function getConversationHistory(sessionId, maxTurns = 8) {
+    const history = memoryStore.get(sessionId) || [];
     
-    formatted_history = []
-    for turn in history:
-        role_label = "USUARIO" if turn["role"] == "user" else "BOT"
-        formatted_history.append(f"{role_label}: {turn['text']}")
+    if (!history.length) return "";
     
-    return "\n".join(formatted_history)
-
-def compute_session_id(space: dict, message: dict, is_dm: bool) -> str:
-    """
-    Computa un ID de sesión estable basado en:
-    - Hilo (thread) si existe -> mantiene contexto por hilo
-    - DM con usuario específico -> mantiene contexto por usuario
-    - Espacio (room) -> contexto compartido en el espacio
-    """
-    # Extraer información relevante
-    thread = message.get("thread", {})
-    thread_name = thread.get("name")
-    space_name = space.get("name", "")
-    sender = message.get("sender", {})
-    user_email = sender.get("email", "unknown")
+    const recentHistory = maxTurns > 0 ? history.slice(-maxTurns * 2) : history;
     
-    # Prioridad de sesión:
-    # 1. Thread específico (mayor granularidad)
-    if thread_name:
-        return f"thread:{thread_name}"
+    return recentHistory
+        .map(entry => `${entry.role === 'user' ? 'USUARIO' : 'BOT'}: ${entry.text}`)
+        .join('\n');
+}
+
+function addToHistory(sessionId, role, text) {
+    if (!memoryStore.has(sessionId)) {
+        memoryStore.set(sessionId, []);
+    }
     
-    # 2. DM con usuario específico
-    if is_dm:
-        return f"dm:{user_email}"
+    const history = memoryStore.get(sessionId);
+    history.push({
+        role,
+        text,
+        timestamp: new Date().toISOString()
+    });
     
-    # 3. Espacio (room) - hilo por defecto del espacio
-    if space_name:
-        return f"space:{space_name}:default"
+    // Mantener solo los últimos 20 mensajes
+    if (history.length > 20) {
+        history.splice(0, history.length - 20);
+    }
+}
+
+function runChain(userInput, sessionId) {
+    const history = getConversationHistory(sessionId);
     
-    # 4. Fallback (no debería pasar)
-    message_name = message.get("name", str(uuid.uuid4()))
-    return f"fallback:{message_name}"
-
-def build_user_prompt_with_context(session_id: str, user_text: str) -> str:
-    """Construye el prompt del usuario incluyendo el contexto de la conversación"""
-    if DISABLE_LOCAL_MEMORY or HISTORY_TURNS == 0:
-        return user_text
+    let response = `Sales Bot responde (Sesión: ${sessionId.substring(0, 8)}...): ${userInput}`;
     
-    history = render_history(session_id)
-    if not history:
-        return user_text
+    if (history) {
+        const messageCount = (memoryStore.get(sessionId) || []).length;
+        response += ` [Recordando ${messageCount} mensajes anteriores]`;
+    }
     
-    # Formato claro para el LLM/agente
-    return f"""<<<HISTORIAL_CONVERSACION>>>
-{history}
-<<<FIN_HISTORIAL>>>
+    return response;
+}
 
-{user_text}"""
+app.post("/webhook", (req, res) => {
+    const payload = req.body;
+    console.log("🔔 Payload recibido:", JSON.stringify(payload, null, 2));
 
-def run_chain(user_input: str, session_id: str) -> str:
-    """
-    Aquí iría tu lógica de negocio o LLM
-    Ahora recibe el session_id para poder mantener contexto
-    """
-    # Ejemplo con contexto
-    history_count = len(get_session_history(session_id))
+    const event = payload?.messagePayload || payload;
+    const space = event?.space || {};
+    const message = event?.message;
+
+    if (!message) {
+        console.log("❗ No hay mensaje, ignorando evento");
+        return res.json({});
+    }
+
+    const sender = message?.sender || {};
+    const userEmail = sender?.email || "unknown";
+    const argument = (message?.argumentText || message?.text || "").trim();
+    const thread = message?.thread || {};
+    const threadName = thread?.name;
+    const isDM = space?.type === "DIRECT_MESSAGE";
+    const threadingState = space?.spaceThreadingState;
+
+    // Generar ID de sesión estable
+    const sessionId = getSessionId(space, message, isDM);
+
+    console.log(`   >> Sesión ID: ${sessionId}`);
+    console.log(`   >> Usuario: ${userEmail}`);
+    console.log(`   >> Texto: '${argument}'`);
+
+    // Añadir al historial
+    addToHistory(sessionId, "user", argument || "<vacío>");
+
+    // Generar respuesta
+    const responseText = runChain(argument || "<vacío>", sessionId);
     
-    # Simular respuesta contextual
-    if history_count == 0:
-        return f"¡Hola! Soy Sales Bot. Recibí tu primer mensaje: {user_input}"
-    else:
-        return f"Soy Sales Bot (mensaje #{history_count//2 + 1}), recibí: {user_input}"
+    // Añadir respuesta al historial
+    addToHistory(sessionId, "bot", responseText);
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    payload = await request.json()
-    logger.debug("🔔 Payload completo recibido: %s", payload)
+    // Construir respuesta
+    const responsePayload = { text: responseText };
 
-    # Extraer evento
-    event = payload.get("messagePayload", payload)
+    if (!isDM && threadingState === "THREADED_MESSAGES" && threadName) {
+        responsePayload.thread = { name: threadName };
+    }
 
-    # Validar estructura básica
-    space = event.get("space", {})
-    message = event.get("message")
-    if not message:
-        logger.debug("❗ No hay campo 'message' en el payload, ignorando evento.")
-        return {}
+    console.log("DEBUG respuesta final:", responsePayload);
+    res.json(responsePayload);
+});
 
-    # Extraer información del mensaje
-    raw_text = message.get("text", "")
-    argument = message.get("argumentText", raw_text).strip()
-    
-    # Información de threading
-    thread = message.get("thread", {})
-    thread_name = thread.get("name")
-    is_dm = (space.get("type") == "DIRECT_MESSAGE")
-    threading_state = space.get("spaceThreadingState")
+// Endpoints de debug
+app.get("/sessions", (req, res) => {
+    const sessionsInfo = {};
+    for (const [sessionId, history] of memoryStore.entries()) {
+        sessionsInfo[sessionId] = {
+            messageCount: history.length,
+            lastMessage: history.length > 0 ? history[history.length - 1].timestamp : null
+        };
+    }
+    res.json(sessionsInfo);
+});
 
-    logger.debug("   >> espacio: %s", space)
-    logger.debug("   >> mensaje: %s", message)
-    logger.debug("   >> texto limpio: '%s'", argument)
-    logger.debug("   >> is_dm=%s, threading_state=%s, thread_name=%s",
-                 is_dm, threading_state, thread_name)
+app.get("/session/:sessionId", (req, res) => {
+    const sessionId = req.params.sessionId;
+    res.json({
+        sessionId,
+        history: memoryStore.get(sessionId) || []
+    });
+});
 
-    # *** PARTE CLAVE: Computar sesión estable ***
-    session_id = compute_session_id(space, message, is_dm)
-    logger.debug("   >> session_id computado: %s", session_id)
-    
-    # Construir input con contexto histórico
-    input_with_context = build_user_prompt_with_context(session_id, argument or "<vacío>")
-    logger.debug("   >> input con contexto: %s", input_with_context[:200] + "..." if len(input_with_context) > 200 else input_with_context)
-
-    # Generar respuesta (aquí llamarías a tu LLM/Langflow)
-    response_text = run_chain(input_with_context, session_id)
-
-    # *** ACTUALIZAR MEMORIA DE SESIÓN ***
-    push_turn(session_id, "user", argument or "<vacío>")
-    push_turn(session_id, "bot", response_text)
-    
-    logger.debug("   >> historial actualizado para sesión %s: %d turnos", 
-                 session_id, len(get_session_history(session_id)))
-
-    # Construir respuesta
-    response_payload = {"text": response_text}
-
-    # Mantener en el mismo hilo si es necesario
-    if not is_dm and threading_state == "THREADED_MESSAGES" and thread_name:
-        response_payload["thread"] = {"name": thread_name}
-
-    logger.debug("DEBUG respuesta final a enviar: %s", response_payload)
-    return response_payload
-
-# Endpoint para debug/admin de sesiones
-@app.get("/sessions")
-async def get_sessions():
-    """Endpoint para ver el estado de las sesiones (útil para debug)"""
-    sessions_info = {}
-    for session_id, history in session_memory.items():
-        sessions_info[session_id] = {
-            "turns": len(history),
-            "last_activity": history[-1]["ts"].isoformat() if history else None,
-            "preview": history[-2:] if len(history) >= 2 else history
-        }
-    return sessions_info
-
-@app.delete("/sessions/{session_id}")
-async def clear_session(session_id: str):
-    """Limpiar una sesión específica"""
-    if session_id in session_memory:
-        del session_memory[session_id]
-        return {"message": f"Sesión {session_id} eliminada"}
-    return {"message": "Sesión no encontrada"}
-
-if __name__ == "__main__":
-    import os
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="debug")
+app.listen(PORT, () => {
+    console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
+});
