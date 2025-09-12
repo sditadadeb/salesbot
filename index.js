@@ -1,5 +1,5 @@
 // index.js
-// Bot de Google Chat con memoria persistente corregida para DMs
+// Bot de Google Chat con timeouts corregidos
 const express = require("express");
 const crypto = require("crypto");
 
@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
-const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 25000);
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 45000); // 45 segundos
 const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES || 2);
 const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS || 6));
 const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
@@ -28,8 +28,8 @@ function truncate(s, n = 500) {
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 // ---------------------- Memoria local por sesión ----------------------
-const mem = new Map();
-const sessionMetadata = new Map();
+const mem = new Map(); 
+const sessionMetadata = new Map(); 
 
 function getHistory(sessionId) {
   return mem.get(sessionId) || [];
@@ -87,7 +87,8 @@ function buildLangflowRunUrl() {
   return `${host}/api/v1/run/${flowId}`;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
+// CORREGIDO: usar LANGFLOW_TIMEOUT_MS consistentemente
+async function fetchWithTimeout(url, options = {}, timeoutMs = LANGFLOW_TIMEOUT_MS) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try { return await fetch(url, { ...options, signal: controller.signal }); }
@@ -113,6 +114,7 @@ function pickTextFromLangflow(json) {
             if (o2?.data?.text) return String(o2.data.text);
             if (o2?.artifacts?.text) return String(o2.artifacts.text);
             if (o2?.results?.message?.text) return String(o2.results.message.text);
+            if (o2?.results?.message?.data?.text) return String(o2.results.message.data.text);
           }
         }
       }
@@ -178,7 +180,7 @@ async function callLangflow(userText, sessionId, reqId) {
       const resp = await fetchWithTimeout(
         url,
         { method: "POST", headers, body: JSON.stringify(payload) },
-        LANGFLOW_TIMEOUT_MS
+        LANGFLOW_TIMEOUT_MS // CORREGIDO: usar la constante
       );
 
       const contentType = resp.headers.get("content-type") || "";
@@ -221,7 +223,7 @@ async function callLangflow(userText, sessionId, reqId) {
 
       if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
         if (i < attempts) {
-          const delay = Math.min(2000 * i, 5000);
+          const delay = Math.min(3000 * i, 8000); // Delay incrementado
           log("info", "langflow.retrying_after_backoff", { reqId, sessionId, inMs: delay });
           await sleep(delay);
           continue;
@@ -246,11 +248,13 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Health
 app.get("/", (req, res) => {
   log("debug", "healthcheck", { reqId: req.reqId });
   res.status(200).send("OK - Bot con memoria funcionando");
 });
 
+// Egress IP
 app.get("/egress", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json");
@@ -263,29 +267,30 @@ app.get("/egress", async (req, res) => {
   }
 });
 
-// ---------------------- CORRECCIÓN CLAVE: Session ID para DMs ----------------------
+// ---------------------- Utilidades de sesión ----------------------
 function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
   let sessionBase;
   
-  if (isDM && spaceName) {
-    // CORRECCIÓN: Para DMs, usar siempre el space name + email, 
-    // ignorar thread names porque Google Chat los crea automáticamente
-    sessionBase = `dm_${spaceName}_${userEmail || 'unknown'}`;
-    log("debug", "session.dm_detected", { spaceName, userEmail, sessionBase });
-  } else if (threadName && !isDM) {
-    // Para hilos reales en rooms/spaces, usar el thread name
+  if (threadName) {
     sessionBase = threadName;
+  } else if (isDM && userEmail) {
+    sessionBase = `dm_${userEmail}`;
   } else if (spaceName) {
-    // Para espacios sin hilo específico
     sessionBase = `${spaceName}_default`;
   } else {
-    // Fallback
-    sessionBase = `fallback_${userEmail || crypto.randomUUID()}`;
+    sessionBase = `fallback_${msg?.name || crypto.randomUUID()}`;
   }
 
-  // Crear hash consistente
   const hash = crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 12);
-  log("debug", "session.computed", { sessionBase, hash, isDM, threadName, spaceName });
+  
+  log("debug", "session.computed", {
+    sessionBase: truncate(sessionBase, 100),
+    hash,
+    isDM,
+    threadName: threadName ? truncate(threadName, 50) : null,
+    spaceName: spaceName ? truncate(spaceName, 50) : null
+  });
+  
   return hash;
 }
 
@@ -315,7 +320,7 @@ app.post("/events", async (req, res) => {
         chatDataAction: {
           createMessageAction: {
             message: { 
-              text: `¡Hola! Soy un bot con memoria persistente. Recordaré nuestra conversación. ¡Pregúntame algo!`
+              text: `¡Hola! Soy tu asistente de ventas con memoria. Recordaré nuestra conversación en este ${isDM ? 'chat directo' : 'hilo'}. ¡Pregúntame sobre deals, procesos de venta, o cualquier duda!`
             },
           },
         },
@@ -325,7 +330,6 @@ app.post("/events", async (req, res) => {
     return res.status(200).json(welcome);
   }
 
-  // CORRECCIÓN: Generar session ID estable para DMs
   const sessionId = computeSessionId({ 
     threadName, 
     isDM, 
@@ -334,7 +338,6 @@ app.post("/events", async (req, res) => {
     msg 
   });
 
-  // Actualizar metadata de sesión
   updateSessionMetadata(sessionId, {
     threadName,
     isDM,
@@ -365,9 +368,9 @@ app.post("/events", async (req, res) => {
     if (/Client IP not allowed/i.test(String(e.message))) {
       agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Revisa la configuración de IP allowlist.";
     } else if (/timeout|aborted/i.test(String(e.message))) {
-      agentText = "El servicio está tardando mucho en responder. Intenta de nuevo en un momento.";
+      agentText = "El servicio está tardando mucho en responder. Intenta de nuevo en un momento o reformula tu pregunta.";
     } else {
-      agentText = `Error al procesar tu mensaje: ${e.message}`;
+      agentText = `Hubo un error procesando tu mensaje: ${e.message}. Intenta de nuevo.`;
     }
   }
 
@@ -377,14 +380,13 @@ app.post("/events", async (req, res) => {
     log("warn", "langflow.empty_output_fallback", { reqId, sessionId });
   }
 
-  // Agregar al historial después de la respuesta exitosa
   if (!DISABLE_LOCAL_MEMORY) {
     pushTurn(sessionId, "user", textRaw);
     pushTurn(sessionId, "bot", agentText);
   }
 
   const message = { text: agentText };
-  if (threadName && !isDM) message.thread = { name: threadName }; // Solo para rooms, no DMs
+  if (threadName) message.thread = { name: threadName };
 
   const reply = {
     hostAppDataAction: {
@@ -423,6 +425,7 @@ app.get("/sessions", (req, res) => {
   }
   res.json({
     totalSessions: mem.size,
+    timeoutMs: LANGFLOW_TIMEOUT_MS,
     hybridMemory: USE_HYBRID_MEMORY,
     maxHistoryTurns: HISTORY_TURNS,
     sessions
@@ -447,6 +450,7 @@ app.get("/sessions/:sessionId", (req, res) => {
   });
 });
 
+// ---------------------- Start ----------------------
 app.listen(PORT, () => {
   log("info", "server.started", {
     port: PORT,
