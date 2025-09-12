@@ -1,5 +1,5 @@
 // index.js
-// Bot de Google Chat con memoria híbrida corregida
+// Bot de Google Chat con memoria persistente corregida para DMs
 const express = require("express");
 const crypto = require("crypto");
 
@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
-const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 25000); // Incrementado
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 25000);
 const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES || 2);
 const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS || 6));
 const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
@@ -28,8 +28,8 @@ function truncate(s, n = 500) {
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 // ---------------------- Memoria local por sesión ----------------------
-const mem = new Map(); // sessionId -> [{role:"user"|"bot", text, ts}, ...]
-const sessionMetadata = new Map(); // sessionId -> {created, lastUsed, threadName, userEmail, etc}
+const mem = new Map();
+const sessionMetadata = new Map();
 
 function getHistory(sessionId) {
   return mem.get(sessionId) || [];
@@ -61,12 +61,10 @@ function renderHistoryForLangflow(sessionId) {
   if (!USE_HYBRID_MEMORY) return "";
   
   const arr = getHistory(sessionId);
-  if (!arr.length) return ""; // No hay historial previo
+  if (!arr.length) return "";
   
-  // Formato optimizado para Langflow - solo mensajes previos
   const contextLines = ["=== HISTORIAL PREVIO DE LA CONVERSACIÓN ==="];
   
-  // Tomar solo los mensajes anteriores (no incluir el actual)
   for (const entry of arr) {
     if (entry.role === "user") {
       contextLines.push(`Usuario: ${entry.text}`);
@@ -135,12 +133,10 @@ function pickTextFromLangflow(json) {
   return "";
 }
 
-// Llamada a Langflow con memoria híbrida corregida
 async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
 
-  // CORRECCIÓN: Construir contexto SOLO con historial previo
   let finalInput = userText;
   if (USE_HYBRID_MEMORY && !DISABLE_LOCAL_MEMORY) {
     const context = renderHistoryForLangflow(sessionId);
@@ -225,7 +221,7 @@ async function callLangflow(userText, sessionId, reqId) {
 
       if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
         if (i < attempts) {
-          const delay = Math.min(2000 * i, 5000); // Incrementado el delay
+          const delay = Math.min(2000 * i, 5000);
           log("info", "langflow.retrying_after_backoff", { reqId, sessionId, inMs: delay });
           await sleep(delay);
           continue;
@@ -250,13 +246,11 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Health
 app.get("/", (req, res) => {
   log("debug", "healthcheck", { reqId: req.reqId });
   res.status(200).send("OK - Bot con memoria funcionando");
 });
 
-// Egress IP
 app.get("/egress", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json");
@@ -269,26 +263,29 @@ app.get("/egress", async (req, res) => {
   }
 });
 
-// ---------------------- Utilidades de sesión ----------------------
+// ---------------------- CORRECCIÓN CLAVE: Session ID para DMs ----------------------
 function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
   let sessionBase;
   
-  if (threadName) {
-    // Usar el thread name completo pero limpiarlo
+  if (isDM && spaceName) {
+    // CORRECCIÓN: Para DMs, usar siempre el space name + email, 
+    // ignorar thread names porque Google Chat los crea automáticamente
+    sessionBase = `dm_${spaceName}_${userEmail || 'unknown'}`;
+    log("debug", "session.dm_detected", { spaceName, userEmail, sessionBase });
+  } else if (threadName && !isDM) {
+    // Para hilos reales en rooms/spaces, usar el thread name
     sessionBase = threadName;
-  } else if (isDM && userEmail) {
-    // Para DMs, usar el email del usuario
-    sessionBase = `dm_${userEmail}`;
   } else if (spaceName) {
     // Para espacios sin hilo específico
     sessionBase = `${spaceName}_default`;
   } else {
-    // Fallback usando el nombre del mensaje si existe
-    sessionBase = `fallback_${msg?.name || crypto.randomUUID()}`;
+    // Fallback
+    sessionBase = `fallback_${userEmail || crypto.randomUUID()}`;
   }
 
-  // Crear hash consistente pero legible
+  // Crear hash consistente
   const hash = crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 12);
+  log("debug", "session.computed", { sessionBase, hash, isDM, threadName, spaceName });
   return hash;
 }
 
@@ -318,7 +315,7 @@ app.post("/events", async (req, res) => {
         chatDataAction: {
           createMessageAction: {
             message: { 
-              text: `¡Hola! Soy un bot con memoria persistente. Recordaré nuestra conversación en este ${isDM ? 'chat directo' : 'hilo'}. ¡Pregúntame algo!`
+              text: `¡Hola! Soy un bot con memoria persistente. Recordaré nuestra conversación. ¡Pregúntame algo!`
             },
           },
         },
@@ -328,7 +325,7 @@ app.post("/events", async (req, res) => {
     return res.status(200).json(welcome);
   }
 
-  // Generar session ID consistente
+  // CORRECCIÓN: Generar session ID estable para DMs
   const sessionId = computeSessionId({ 
     threadName, 
     isDM, 
@@ -360,9 +357,6 @@ app.post("/events", async (req, res) => {
     userEmail: userEmail ? userEmail.substring(0, 10) + "..." : null
   });
 
-  // CORRECCIÓN: NO agregar el mensaje del usuario antes de llamar a Langflow
-  // Esto permite que el contexto sea solo del historial previo
-
   let agentText = "";
   try {
     agentText = await callLangflow(textRaw, sessionId, reqId);
@@ -383,14 +377,14 @@ app.post("/events", async (req, res) => {
     log("warn", "langflow.empty_output_fallback", { reqId, sessionId });
   }
 
-  // AHORA SÍ agregar ambos mensajes al historial después de la respuesta exitosa
+  // Agregar al historial después de la respuesta exitosa
   if (!DISABLE_LOCAL_MEMORY) {
     pushTurn(sessionId, "user", textRaw);
     pushTurn(sessionId, "bot", agentText);
   }
 
   const message = { text: agentText };
-  if (threadName) message.thread = { name: threadName };
+  if (threadName && !isDM) message.thread = { name: threadName }; // Solo para rooms, no DMs
 
   const reply = {
     hostAppDataAction: {
@@ -453,7 +447,6 @@ app.get("/sessions/:sessionId", (req, res) => {
   });
 });
 
-// ---------------------- Start ----------------------
 app.listen(PORT, () => {
   log("info", "server.started", {
     port: PORT,
