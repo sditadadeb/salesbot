@@ -1,20 +1,17 @@
-// index.js
-// Bot de Google Chat con memoria híbrida y timeouts corregidos
+// index.js - TIMEOUT CORREGIDO
 const express = require("express");
 const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CONFIGURACIÓN CORREGIDA - usar 45 segundos por defecto
-const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
-const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS || 45000); // 45 segundos
-const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES || 2);
-const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS || 6));
+// ASEGURAR QUE EL TIMEOUT SE LEA CORRECTAMENTE
+const LANGFLOW_TIMEOUT_MS = Number(process.env.LANGFLOW_TIMEOUT_MS) || 45000; // 45 segundos por defecto
+const LANGFLOW_RETRIES = Number(process.env.LANGFLOW_RETRIES) || 2;
+const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
+const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS) || 6);
 const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
 const USE_HYBRID_MEMORY = String(process.env.USE_HYBRID_MEMORY || "1") === "1";
-
-console.log(`🚀 INICIANDO BOT CON TIMEOUT: ${LANGFLOW_TIMEOUT_MS}ms`);
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 function log(level, msg, meta = {}) {
@@ -66,21 +63,18 @@ function renderHistoryForLangflow(sessionId) {
   const arr = getHistory(sessionId);
   if (!arr.length) return "";
   
-  const contextLines = ["=== CONVERSACIÓN PREVIA ==="];
+  const contextLines = ["=== HISTORIAL PREVIO DE LA CONVERSACIÓN ==="];
   
-  // Solo los últimos turnos
-  const recentHistory = arr.slice(-Math.min(8, HISTORY_TURNS * 2));
-  for (const entry of recentHistory) {
+  for (const entry of arr) {
     if (entry.role === "user") {
-      contextLines.push(`👤 Usuario: ${entry.text}`);
+      contextLines.push(`Usuario: ${entry.text}`);
     } else {
-      contextLines.push(`🤖 Asistente: ${entry.text}`);
+      contextLines.push(`Asistente: ${entry.text}`);
     }
   }
   
-  contextLines.push("=== FIN CONVERSACIÓN PREVIA ===");
+  contextLines.push("=== FIN HISTORIAL ===");
   contextLines.push("");
-  contextLines.push("Nueva pregunta:");
   
   return contextLines.join("\n");
 }
@@ -93,13 +87,43 @@ function buildLangflowRunUrl() {
   return `${host}/api/v1/run/${flowId}`;
 }
 
+// FUNCIÓN MEJORADA CON TIMEOUT EXPLÍCITO
 async function fetchWithTimeout(url, options = {}, timeoutMs = LANGFLOW_TIMEOUT_MS) {
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try { 
-    return await fetch(url, { ...options, signal: controller.signal }); 
-  } finally { 
-    clearTimeout(id); 
+  const startTime = Date.now();
+  
+  const timeoutId = setTimeout(() => {
+    log("warn", "fetch.timeout", { url, timeoutMs, elapsedMs: Date.now() - startTime });
+    controller.abort();
+  }, timeoutMs);
+  
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    const elapsedMs = Date.now() - startTime;
+    
+    log("debug", "fetch.completed", { 
+      url, 
+      status: response.status, 
+      ok: response.ok, 
+      elapsedMs,
+      timeoutMs
+    });
+    
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    const elapsedMs = Date.now() - startTime;
+    
+    log("warn", "fetch.error", { 
+      url, 
+      error: error.message, 
+      elapsedMs, 
+      timeoutMs,
+      wasTimeout: elapsedMs >= timeoutMs * 0.95 // 95% del timeout
+    });
+    
+    throw error;
   }
 }
 
@@ -129,6 +153,17 @@ function pickTextFromLangflow(json) {
     }
   } catch {}
 
+  try {
+    const stack = [json];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+      seen.add(cur);
+      if (typeof cur.text === "string") return cur.text;
+      for (const k of Object.keys(cur)) stack.push(cur[k]);
+    }
+  } catch {}
   return "";
 }
 
@@ -136,12 +171,11 @@ async function callLangflow(userText, sessionId, reqId) {
   const url = buildLangflowRunUrl();
   if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
 
-  // Construir input con contexto híbrido
   let finalInput = userText;
   if (USE_HYBRID_MEMORY && !DISABLE_LOCAL_MEMORY) {
     const context = renderHistoryForLangflow(sessionId);
     if (context) {
-      finalInput = context + userText;
+      finalInput = context + "Pregunta actual: " + userText;
     }
   }
 
@@ -165,14 +199,14 @@ async function callLangflow(userText, sessionId, reqId) {
   for (let i = 1; i <= attempts; i++) {
     const startTime = Date.now();
     
-    log("info", "langflow.request", {
+    log("info", "langflow.request", { // Cambié a 'info' para que sea más visible
       reqId, attempt: `${i}/${attempts}`,
       url, timeoutMs: LANGFLOW_TIMEOUT_MS,
       sessionId, 
       originalInput: truncate(userText, 200),
       finalInputPreview: truncate(finalInput, 400),
       hasContext: finalInput !== userText,
-      historyLength: getHistory(sessionId).length,
+      historyLength: getHistory(sessionId).length
     });
 
     try {
@@ -182,15 +216,15 @@ async function callLangflow(userText, sessionId, reqId) {
         LANGFLOW_TIMEOUT_MS
       );
 
-      const elapsed = Date.now() - startTime;
       const contentType = resp.headers.get("content-type") || "";
       const raw = await resp.text();
+      const elapsedMs = Date.now() - startTime;
 
       log("info", "langflow.response", {
         reqId, attempt: `${i}/${attempts}`,
-        status: resp.status, ok: resp.ok, 
-        elapsedMs: elapsed,
-        rawPreview: truncate(raw, 300),
+        status: resp.status, ok: resp.ok, contentType,
+        elapsedMs,
+        rawPreview: truncate(raw, 400),
       });
 
       if (!resp.ok) {
@@ -200,6 +234,12 @@ async function callLangflow(userText, sessionId, reqId) {
           throw new Error(`Langflow HTTP ${resp.status}: ${truncate(raw, 300)}`);
         }
       } else {
+        const looksHtml = /^\s*</.test(raw) || contentType.includes("text/html");
+        const looksJson = contentType.includes("application/json");
+        if (looksHtml || (!looksJson && !raw.trim().startsWith("{") && !raw.trim().startsWith("["))) {
+          log("warn", "langflow.non_json_response", { reqId, contentType, rawPreview: truncate(raw, 200) });
+          return "";
+        }
         let json;
         try { json = JSON.parse(raw); }
         catch {
@@ -209,25 +249,26 @@ async function callLangflow(userText, sessionId, reqId) {
         const out = (pickTextFromLangflow(json) || "").trim();
         log("info", "langflow.extracted", { 
           reqId, sessionId, 
-          outPreview: truncate(out, 200),
-          elapsedMs: elapsed 
+          outPreview: truncate(out, 300), 
+          elapsedMs 
         });
         return out;
       }
     } catch (e) {
-      const elapsed = Date.now() - startTime;
       lastErr = e;
+      const elapsedMs = Date.now() - startTime;
       const msg = String(e?.message || e);
-      const abortLike = /aborted|timeout|The operation was aborted/i.test(msg);
+      const abortLike = /aborted|timeout|The operation was aborted|This operation was aborted/i.test(msg);
+      const wasTimeout = elapsedMs >= LANGFLOW_TIMEOUT_MS * 0.95;
       
       log("warn", "langflow.attempt_failed", { 
         reqId, attempt: `${i}/${attempts}`, sessionId, 
-        error: msg, elapsedMs: elapsed, wasTimeout: abortLike 
+        error: msg, elapsedMs, wasTimeout 
       });
 
-      if (abortLike || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
+      if (abortLike || wasTimeout || (lastErr && /Langflow HTTP (5\d\d|429)/.test(String(lastErr.message)))) {
         if (i < attempts) {
-          const delay = Math.min(3000 * i, 8000);
+          const delay = Math.min(5000 * i, 10000); // 5s, 10s
           log("info", "langflow.retrying_after_backoff", { reqId, sessionId, inMs: delay });
           await sleep(delay);
           continue;
@@ -246,18 +287,16 @@ app.use((req, _res, next) => {
   req.reqId = reqId;
   log("info", "http.request", {
     reqId, method: req.method, path: req.path,
+    ip: req.ip, ua: req.headers["user-agent"],
+    contentType: req.headers["content-type"],
   });
   next();
 });
 
 // Health
 app.get("/", (req, res) => {
-  res.status(200).json({ 
-    status: "OK", 
-    timeout: LANGFLOW_TIMEOUT_MS,
-    hybridMemory: USE_HYBRID_MEMORY,
-    activeSessions: mem.size
-  });
+  log("debug", "healthcheck", { reqId: req.reqId });
+  res.status(200).send(`OK - Bot funcionando. Timeout: ${LANGFLOW_TIMEOUT_MS}ms`);
 });
 
 // Egress IP
@@ -268,38 +307,33 @@ app.get("/egress", async (req, res) => {
     log("info", "egress.ip", { ip: j.ip });
     res.json(j);
   } catch (e) {
+    log("warn", "egress.ip.failed", { error: e.message });
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---------------------- Utilidades de sesión CORREGIDAS ----------------------
+// ---------------------- Utilidades de sesión ----------------------
 function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
   let sessionBase;
   
   if (threadName) {
-    // CORREGIDO: usar solo el ID del thread, no el path completo
-    const threadId = threadName.split('/').pop() || threadName;
-    sessionBase = `thread_${threadId}`;
+    sessionBase = threadName;
   } else if (isDM && userEmail) {
-    // Para DMs, usar el email
     sessionBase = `dm_${userEmail}`;
   } else if (spaceName) {
-    // Para espacios sin hilo
-    const spaceId = spaceName.split('/').pop() || spaceName;
-    sessionBase = `space_${spaceId}`;
+    sessionBase = `${spaceName}_default`;
   } else {
     sessionBase = `fallback_${msg?.name || crypto.randomUUID()}`;
   }
 
-  // Hash más simple y estable
-  const hash = crypto.createHash('md5').update(sessionBase).digest('hex').substring(0, 12);
+  const hash = crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 12);
   
   log("debug", "session.computed", {
-    threadName: threadName ? truncate(threadName, 50) : null,
     sessionBase: truncate(sessionBase, 100),
     hash,
     isDM,
-    userEmail: userEmail ? userEmail.substring(0, 10) + "..." : null
+    threadName: threadName ? truncate(threadName, 50) : null,
+    spaceName: spaceName ? truncate(spaceName, 50) : null
   });
   
   return hash;
@@ -309,6 +343,8 @@ function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
 app.post("/events", async (req, res) => {
   const reqId = req.reqId;
   const body = req.body || {};
+  
+  log("debug", "chat.event.raw", { reqId, bodyPreview: truncate(JSON.stringify(body), 1500) });
 
   const mp = body?.chat?.messagePayload;
   const msg = mp?.message;
@@ -322,23 +358,22 @@ app.post("/events", async (req, res) => {
     reqId, userEmail, spaceName, isDM, threadName, textRaw,
   });
 
-  // Si no hay mensaje (ej: alta al espacio)
   if (!msg) {
     const welcome = {
       hostAppDataAction: {
         chatDataAction: {
           createMessageAction: {
             message: { 
-              text: `¡Hola! Soy Numi Ventas 💜 Tu asistente con memoria. Recordaré nuestra conversación. ¡Pregúntame lo que necesites!`
+              text: `¡Hola! Soy tu asistente de ventas con memoria. Recordaré nuestra conversación en este ${isDM ? 'chat directo' : 'hilo'}. ¡Pregúntame sobre deals, procesos de venta, o cualquier duda!`
             },
           },
         },
       },
     };
+    log("debug", "chat.reply.welcome", { reqId });
     return res.status(200).json(welcome);
   }
 
-  // CORREGIDO: usar función de sessionId mejorada
   const sessionId = computeSessionId({ 
     threadName, 
     isDM, 
@@ -355,6 +390,7 @@ app.post("/events", async (req, res) => {
     created: sessionMetadata.get(sessionId)?.created || Date.now()
   });
 
+  const metadata = getSessionMetadata(sessionId);
   const currentHistory = getHistory(sessionId);
 
   log("info", "chat.session_info", { 
@@ -373,21 +409,20 @@ app.post("/events", async (req, res) => {
   } catch (e) {
     log("error", "langflow.error", { reqId, sessionId, error: e.message });
     if (/Client IP not allowed/i.test(String(e.message))) {
-      agentText = "❌ No tengo permiso para conectar con el servicio. Contacta al administrador para allowlistear la IP.";
+      agentText = "No tengo permiso para hablar con el agente (IP bloqueada). Revisa la configuración de IP allowlist.";
     } else if (/timeout|aborted/i.test(String(e.message))) {
-      agentText = "⏱️ El servicio está tardando mucho. Por favor intenta reformular tu pregunta o espera un momento.";
+      agentText = "El servicio está tardando mucho en responder. Intenta de nuevo en un momento o reformula tu pregunta.";
     } else {
-      agentText = `🔧 Hubo un error técnico: ${e.message}. Intenta de nuevo.`;
+      agentText = `Hubo un error procesando tu mensaje: ${e.message}. Intenta de nuevo.`;
     }
   }
 
   if (!agentText) {
-    const historyCount = currentHistory.length;
-    agentText = `Recibí tu mensaje: "${textRaw}". Conversación #${Math.ceil((historyCount + 2)/2)} en sesión ${sessionId}`;
-    log("warn", "langflow.empty_fallback", { reqId, sessionId });
+    const historyCount = getHistory(sessionId).length;
+    agentText = `Recibí tu mensaje: "${textRaw}". Esta sería nuestra conversación #${Math.ceil((historyCount + 2)/2)} (sesión: ${sessionId})`;
+    log("warn", "langflow.empty_output_fallback", { reqId, sessionId });
   }
 
-  // Agregar al historial después de respuesta exitosa
   if (!DISABLE_LOCAL_MEMORY) {
     pushTurn(sessionId, "user", textRaw);
     pushTurn(sessionId, "bot", agentText);
@@ -404,11 +439,12 @@ app.post("/events", async (req, res) => {
     },
   };
 
+  const finalHistory = getHistory(sessionId);
   log("info", "chat.reply.sending", { 
     reqId, 
     sessionId,
-    historyLength: getHistory(sessionId).length,
-    replyPreview: truncate(agentText, 150)
+    historyLength: finalHistory.length,
+    replyPreview: truncate(agentText, 200)
   });
 
   return res.status(200).json(reply);
@@ -425,9 +461,9 @@ app.get("/sessions", (req, res) => {
       created: new Date(metadata.created || 0).toISOString(),
       lastUsed: new Date(metadata.lastUsed || 0).toISOString(),
       isDM: metadata.isDM,
-      threadName: metadata.threadName ? truncate(metadata.threadName, 30) : null,
+      threadName: metadata.threadName ? truncate(metadata.threadName, 50) : null,
       userEmail: metadata.userEmail ? metadata.userEmail.substring(0, 15) + "..." : null,
-      recentMessages: history.slice(-2).map(m => `${m.role}: ${truncate(m.text, 40)}`)
+      lastMessages: history.slice(-4).map(m => `${m.role}: ${truncate(m.text, 60)}`)
     };
   }
   res.json({
@@ -439,18 +475,36 @@ app.get("/sessions", (req, res) => {
   });
 });
 
+app.get("/sessions/:sessionId", (req, res) => {
+  const sessionId = req.params.sessionId;
+  const history = getHistory(sessionId);
+  const metadata = getSessionMetadata(sessionId);
+  
+  if (history.length === 0) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+  
+  res.json({
+    sessionId,
+    metadata,
+    messageCount: history.length,
+    conversationTurns: Math.ceil(history.length / 2),
+    messages: history
+  });
+});
+
 // ---------------------- Start ----------------------
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor iniciado en puerto ${PORT}`);
-  console.log(`⏱️  Timeout Langflow: ${LANGFLOW_TIMEOUT_MS}ms`);
-  console.log(`🧠 Memoria híbrida: ${USE_HYBRID_MEMORY ? 'ACTIVA' : 'INACTIVA'}`);
-  console.log(`📝 Max turnos historial: ${HISTORY_TURNS}`);
-  
   log("info", "server.started", {
     port: PORT,
     langflowHost: process.env.LANGFLOW_HOST || null,
     flowId: process.env.LANGFLOW_FLOW_ID || null,
-    timeoutMs: LANGFLOW_TIMEOUT_MS,
+    hasApiKey: !!process.env.LANGFLOW_API_KEY,
+    timeoutMs: LANGFLOW_TIMEOUT_MS, // Debe mostrar 45000 ahora
+    retries: LANGFLOW_RETRIES,
+    logLevel: LOG_LEVEL,
+    historyTurns: HISTORY_TURNS,
+    disableLocalMemory: DISABLE_LOCAL_MEMORY,
     useHybridMemory: USE_HYBRID_MEMORY,
   });
 });
