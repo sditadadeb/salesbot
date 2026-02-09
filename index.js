@@ -13,6 +13,15 @@ const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS) || 6);
 const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
 const USE_HYBRID_MEMORY = String(process.env.USE_HYBRID_MEMORY || "1") === "1";
 
+const ENVIRONMENTS = {
+  "qa": {
+    "host": process.env.LANGFLOW_HOST_QA || "",
+  },
+  "prod": {
+    "host": process.env.LANGFLOW_HOST_PRODUCTION || "",
+  },
+}
+
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 function log(level, msg, meta = {}) {
   if ((LEVELS[level] || 99) < (LEVELS[LOG_LEVEL] || 99)) return;
@@ -80,9 +89,9 @@ function renderHistoryForLangflow(sessionId) {
 }
 
 // ---------------------- Langflow helpers ----------------------
-function buildLangflowRunUrl() {
-  const host = String(process.env.LANGFLOW_HOST || "").replace(/\/+$/, "");
-  const flowId = process.env.LANGFLOW_FLOW_ID || "";
+function buildLangflowRunUrl(environment = 'qa', flowId) {
+  const host = String(ENVIRONMENTS[environment]["host"] || "").replace(/\/+$/, "");
+  flowId = flowId || process.env.LANGFLOW_FLOW_ID || "";
   if (!host || !flowId) return "";
   return `${host}/api/v1/run/${flowId}`;
 }
@@ -167,9 +176,9 @@ function pickTextFromLangflow(json) {
   return "";
 }
 
-async function callLangflow(userText, sessionId, reqId) {
-  const url = buildLangflowRunUrl();
-  if (!url) throw new Error("LANGFLOW_HOST / LANGFLOW_FLOW_ID no configuradas");
+async function callLangflow(userText, sessionId, reqId, environment, flowId, apiKey) {
+  const url = buildLangflowRunUrl(environment, flowId);
+  if (!url) throw new Error("LANGFLOW_HOST_QA / LANGFLOW_HOST_PRODUCTION / LANGFLOW_FLOW_ID no configuradas");
 
   let finalInput = userText;
   if (USE_HYBRID_MEMORY && !DISABLE_LOCAL_MEMORY) {
@@ -190,7 +199,7 @@ async function callLangflow(userText, sessionId, reqId) {
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json",
-    "x-api-key": process.env.LANGFLOW_API_KEY || "",
+    "x-api-key": apiKey || ""
   };
 
   let lastErr;
@@ -340,7 +349,9 @@ function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
 }
 
 // ---------------------- Webhook Google Chat ----------------------
-app.post("/events", async (req, res) => {
+app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
+  const { environment, flowId, apiKey } = req.params;
+
   const reqId = req.reqId;
   const body = req.body || {};
   
@@ -405,7 +416,7 @@ app.post("/events", async (req, res) => {
 
   let agentText = "";
   try {
-    agentText = await callLangflow(textRaw, sessionId, reqId);
+    agentText = await callLangflow(textRaw, sessionId, reqId, environment, flowId, apiKey);
   } catch (e) {
     log("error", "langflow.error", { reqId, sessionId, error: e.message });
     if (/Client IP not allowed/i.test(String(e.message))) {
@@ -497,9 +508,9 @@ app.get("/sessions/:sessionId", (req, res) => {
 app.listen(PORT, () => {
   log("info", "server.started", {
     port: PORT,
-    langflowHost: process.env.LANGFLOW_HOST || null,
     flowId: process.env.LANGFLOW_FLOW_ID || null,
-    hasApiKey: !!process.env.LANGFLOW_API_KEY,
+    host_qa: process.env.LANGFLOW_HOST_QA || null,
+    host_prod: process.env.LANGFLOW_HOST_PRODUCTION || null,
     timeoutMs: LANGFLOW_TIMEOUT_MS, // Debe mostrar 45000 ahora
     retries: LANGFLOW_RETRIES,
     logLevel: LOG_LEVEL,
