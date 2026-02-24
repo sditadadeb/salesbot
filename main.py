@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import logging
+import json
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("sales-bot")
@@ -55,8 +56,19 @@ async def webhook(request: Request):
 
     # generamos respuesta
     response_text = run_chain(argument or "<vacío>")
-    response_payload = {"text": response_text}
 
+
+    response_json = {
+        "text": response_text,
+        "space": space,
+        "message": message,
+        "thread": thread,
+        "thread_name": thread_name,
+        "is_dm": is_dm,
+        "threading_state": threading_state
+    }
+    #response_payload = {"text": response_text}
+    response_payload = response_json
     # si es sala con hilos, devolvemos en el mismo hilo
     if not is_dm and threading_state == "THREADED_MESSAGES" and thread_name:
         response_payload["thread"] = {"name": thread_name}
