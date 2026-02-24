@@ -375,7 +375,7 @@ app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
         chatDataAction: {
           createMessageAction: {
             message: { 
-              text: `¡Hola! Se instaló la aplicación correctamente. Recordaré nuestra conversación en este ${isDM ? 'chat directo' : 'hilo'}. ¡Pregúntame sobre deals, procesos de venta, o cualquier duda!`
+              text: `¡Hola! Se instaló la aplicación correctamente. Recordaré nuestra conversación en este ${isDM ? 'chat directo' : 'hilo'}.`
             },
           },
         },
