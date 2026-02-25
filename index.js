@@ -176,20 +176,25 @@ function pickTextFromLangflow(json) {
   return "";
 }
 
-async function callLangflow(userText, sessionId, reqId, environment, flowId, apiKey) {
+async function callLangflow(userText, sessionId, reqId, environment, flowId, apiKey, chatContext = {}) {
   const url = buildLangflowRunUrl(environment, flowId);
   if (!url) throw new Error("LANGFLOW_HOST_QA / LANGFLOW_HOST_PRODUCTION / LANGFLOW_FLOW_ID no configuradas");
 
-  let finalInput = userText;
+  let textForFlow = userText;
   if (USE_HYBRID_MEMORY && !DISABLE_LOCAL_MEMORY) {
     const context = renderHistoryForLangflow(sessionId);
     if (context) {
-      finalInput = context + "Pregunta actual: " + userText;
+      textForFlow = context + "Pregunta actual: " + userText;
     }
   }
 
+  const structuredInput = JSON.stringify({
+    ...chatContext,
+    text: textForFlow
+  });
+
   const payload = {
-    input_value: finalInput,
+    input_value: structuredInput,
     output_type: "chat", 
     input_type: "chat",
     session_id: sessionId,
@@ -208,13 +213,14 @@ async function callLangflow(userText, sessionId, reqId, environment, flowId, api
   for (let i = 1; i <= attempts; i++) {
     const startTime = Date.now();
     
-    log("info", "langflow.request", { // Cambié a 'info' para que sea más visible
+    log("info", "langflow.request", {
       reqId, attempt: `${i}/${attempts}`,
       url, timeoutMs: LANGFLOW_TIMEOUT_MS,
-      sessionId, 
+      sessionId,
+      chatContext: truncate(JSON.stringify(chatContext), 300),
       originalInput: truncate(userText, 200),
-      finalInputPreview: truncate(finalInput, 400),
-      hasContext: finalInput !== userText,
+      structuredInputPreview: truncate(structuredInput, 500),
+      hasContext: textForFlow !== userText,
       historyLength: getHistory(sessionId).length
     });
 
@@ -322,30 +328,25 @@ app.get("/egress", async (req, res) => {
 });
 
 // ---------------------- Utilidades de sesión ----------------------
-function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
-  let sessionBase;
-  
-  if (threadName) {
-    sessionBase = threadName;
-  } else if (isDM && userEmail) {
-    sessionBase = `dm_${userEmail}`;
-  } else if (spaceName) {
-    sessionBase = `${spaceName}_default`;
+function computeSessionId({ threadName, isDM, userEmail, userName, spaceName, spaceDisplayName, msg }) {
+  let sessionId;
+
+  if (isDM) {
+    const personName = userName || userEmail || "Desconocido";
+    sessionId = `Privado - ${personName}`;
   } else {
-    sessionBase = `fallback_${msg?.name || crypto.randomUUID()}`;
+    sessionId = spaceDisplayName || spaceName || `fallback_${msg?.name || crypto.randomUUID()}`;
   }
 
-  const hash = crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 12);
-  
   log("debug", "session.computed", {
-    sessionBase: truncate(sessionBase, 100),
-    hash,
+    sessionId: truncate(sessionId, 100),
     isDM,
     threadName: threadName ? truncate(threadName, 50) : null,
-    spaceName: spaceName ? truncate(spaceName, 50) : null
+    spaceName: spaceName ? truncate(spaceName, 50) : null,
+    spaceDisplayName: spaceDisplayName ? truncate(spaceDisplayName, 50) : null
   });
-  
-  return hash;
+
+  return sessionId;
 }
 
 // ---------------------- Webhook Google Chat ----------------------
@@ -359,14 +360,61 @@ app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
 
   const mp = body?.chat?.messagePayload;
   const msg = mp?.message;
+  const chatUser = body?.chat?.user || {};
+  const space = mp?.space || {};
+
   const threadName = msg?.thread?.name;
-  const spaceName = mp?.space?.name;
-  const isDM = mp?.space?.type === "DM";
-  const userEmail = body?.chat?.user?.email;
+  const spaceName = space.name || "";
+  const spaceDisplayName = space.displayName || "";
+  const spaceType = space.spaceType || space.type || "";
+  const isDM = space.type === "DM" || spaceType === "DIRECT_MESSAGE";
+
+  const userEmail = chatUser.email || "";
+  const userName = chatUser.displayName || chatUser.name || userEmail || "Desconocido";
+  const userType = chatUser.type || "";
+  const userAvatarUrl = chatUser.avatarUrl || "";
+
   const textRaw = (msg?.argumentText ?? msg?.formattedText ?? msg?.text ?? "").trim();
+  const messageId = msg?.name || "";
+  const messageCreateTime = msg?.createTime || "";
+  const annotations = msg?.annotations || [];
+  const attachments = msg?.attachment || [];
+
+  const eventType = body?.chat?.type || body?.type || "";
+  const eventTime = body?.chat?.eventTime || body?.eventTime || "";
+
+  const chatContext = {
+    user: {
+      name: userName,
+      email: userEmail,
+      type: userType,
+      avatarUrl: userAvatarUrl,
+    },
+    space: {
+      name: spaceName,
+      displayName: spaceDisplayName,
+      type: spaceType,
+      isDM,
+    },
+    message: {
+      id: messageId,
+      threadName,
+      createTime: messageCreateTime,
+      hasAnnotations: annotations.length > 0,
+      annotationCount: annotations.length,
+      hasAttachments: attachments.length > 0,
+      attachmentCount: attachments.length,
+    },
+    event: {
+      type: eventType,
+      time: eventTime,
+    }
+  };
 
   log("info", "chat.event.parsed", {
-    reqId, userEmail, spaceName, isDM, threadName, textRaw,
+    reqId, userEmail, userName, spaceName, spaceDisplayName,
+    isDM, threadName, textRaw, eventType,
+    annotations: annotations.length, attachments: attachments.length,
   });
 
   if (!msg) {
@@ -389,7 +437,9 @@ app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
     threadName, 
     isDM, 
     userEmail, 
+    userName,
     spaceName, 
+    spaceDisplayName,
     msg 
   });
 
@@ -416,7 +466,7 @@ app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
 
   let agentText = "";
   try {
-    agentText = await callLangflow(textRaw, sessionId, reqId, environment, flowId, apiKey);
+    agentText = await callLangflow(textRaw, sessionId, reqId, environment, flowId, apiKey, chatContext);
   } catch (e) {
     log("error", "langflow.error", { reqId, sessionId, error: e.message });
     if (/Client IP not allowed/i.test(String(e.message))) {
@@ -459,6 +509,62 @@ app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
   });
 
   return res.status(200).json(reply);
+});
+
+app.post("/test/:environment/:flowId/:apiKey", async (req, res) => {
+  const { environment, flowId, apiKey } = req.params;
+  const reqId = req.reqId;
+  const body = req.body || {};
+  const text = body.text;
+
+  if (!text) {
+    return res.status(400).json({ error: "Campo 'text' requerido en el body" });
+  }
+
+  const sessionId = `test_${crypto.randomUUID().substring(0, 8)}`;
+
+  const chatContext = {
+    user: {
+      name: body.userName || "TestUser",
+      email: body.userEmail || "test@test.com",
+      type: body.userType || "HUMAN",
+      avatarUrl: "",
+    },
+    space: {
+      name: body.spaceName || "spaces/test",
+      displayName: body.spaceDisplayName || "test-space",
+      type: body.spaceType || "ROOM",
+      isDM: body.isDM || false,
+    },
+    message: {
+      id: `test-msg-${Date.now()}`,
+      threadName: body.threadName || null,
+      createTime: new Date().toISOString(),
+      hasAnnotations: false,
+      annotationCount: 0,
+      hasAttachments: false,
+      attachmentCount: 0,
+    },
+    event: {
+      type: "MESSAGE",
+      time: new Date().toISOString(),
+    }
+  };
+
+  log("info", "test.request", { reqId, chatContext, text: truncate(text, 200) });
+
+  try {
+    const agentText = await callLangflow(text, sessionId, reqId, environment, flowId, apiKey, chatContext);
+    return res.status(200).json({
+      success: true,
+      sessionId,
+      payloadSent: { ...chatContext, text: truncate(text, 200) },
+      response: agentText
+    });
+  } catch (e) {
+    log("error", "test.error", { reqId, error: e.message });
+    return res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // Debug endpoints
