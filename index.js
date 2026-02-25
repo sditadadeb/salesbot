@@ -328,30 +328,25 @@ app.get("/egress", async (req, res) => {
 });
 
 // ---------------------- Utilidades de sesión ----------------------
-function computeSessionId({ threadName, isDM, userEmail, spaceName, msg }) {
-  let sessionBase;
-  
-  if (threadName) {
-    sessionBase = threadName;
-  } else if (isDM && userEmail) {
-    sessionBase = `dm_${userEmail}`;
-  } else if (spaceName) {
-    sessionBase = `${spaceName}_default`;
+function computeSessionId({ threadName, isDM, userEmail, userName, spaceName, spaceDisplayName, msg }) {
+  let sessionId;
+
+  if (isDM) {
+    const personName = userName || userEmail || "Desconocido";
+    sessionId = `Privado - ${personName}`;
   } else {
-    sessionBase = `fallback_${msg?.name || crypto.randomUUID()}`;
+    sessionId = spaceDisplayName || spaceName || `fallback_${msg?.name || crypto.randomUUID()}`;
   }
 
-  const hash = crypto.createHash('sha256').update(sessionBase).digest('hex').substring(0, 12);
-  
   log("debug", "session.computed", {
-    sessionBase: truncate(sessionBase, 100),
-    hash,
+    sessionId: truncate(sessionId, 100),
     isDM,
     threadName: threadName ? truncate(threadName, 50) : null,
-    spaceName: spaceName ? truncate(spaceName, 50) : null
+    spaceName: spaceName ? truncate(spaceName, 50) : null,
+    spaceDisplayName: spaceDisplayName ? truncate(spaceDisplayName, 50) : null
   });
-  
-  return hash;
+
+  return sessionId;
 }
 
 // ---------------------- Webhook Google Chat ----------------------
@@ -442,7 +437,9 @@ app.post("/:environment/events/:flowId/:apiKey", async (req, res) => {
     threadName, 
     isDM, 
     userEmail, 
+    userName,
     spaceName, 
+    spaceDisplayName,
     msg 
   });
 
