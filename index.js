@@ -184,7 +184,7 @@ async function callLangflow(userText, sessionId, reqId, environment, flowId, api
   if (USE_HYBRID_MEMORY && !DISABLE_LOCAL_MEMORY) {
     const context = renderHistoryForLangflow(sessionId);
     if (context) {
-      textForFlow = context + "Pregunta actual: " + userText;
+      textForFlow = "Pregunta actual: " + userText;
     }
   }
 
