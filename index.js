@@ -12,6 +12,7 @@ const LOG_LEVEL = (process.env.LOG_LEVEL || "debug").toLowerCase();
 const HISTORY_TURNS = Math.max(0, Number(process.env.HISTORY_TURNS) || 6);
 const DISABLE_LOCAL_MEMORY = String(process.env.DISABLE_LOCAL_MEMORY || "0") === "1";
 const USE_HYBRID_MEMORY = String(process.env.USE_HYBRID_MEMORY || "1") === "1";
+const DNS = String(process.env.DNS || "");
 
 const ENVIRONMENTS = {
   "qa": {
@@ -204,7 +205,8 @@ async function callLangflow(userText, sessionId, reqId, environment, flowId, api
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json",
-    "x-api-key": apiKey || ""
+    "x-api-key": apiKey || "",
+    "Origin": DNS
   };
 
   let lastErr;
